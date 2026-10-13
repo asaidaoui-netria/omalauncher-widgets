@@ -1,0 +1,591 @@
+widget "fetch" {
+  page: 1
+  order: 2
+  size: 6x2
+  minSize: 6x2
+  padding: 12
+  meta { description: "Your phone's vitals on a dot-matrix display: CPU, memory, storage and temperature, with Pix, a pixel mascot whose mood follows them and who puts on headphones while audio plays. Tap it for every detail, fastfetch style: phone, hardware, battery, launcher and Linux"; version: "2.0"; license: "MIT"; category: "system"; owl: 5 }
+
+  // The phone, from Android: works without Linux.
+  source dev = android.device
+  source sys = android.system every 5s
+  source bat = android.battery
+  // The Arch side, once Linux is installed. Base tools only, so it doesn't make the widget need Linux.
+  source lx = cmd("""
+    . /etc/os-release
+    printf '{"os":"%s","pkgs":%s,"explicit":%s,"shell":"%s","upgraded":"%s"}' \
+      "$PRETTY_NAME" "$(pacman -Qq | wc -l)" "$(pacman -Qqe | wc -l)" \
+      "$(basename "$SHELL") $(bash --version | head -1 | awk '{print $4}' | cut -d'(' -f1)" \
+      "$(grep -a 'starting full system upgrade' /var/log/pacman.log 2>/dev/null | tail -1 | cut -c2-11)"
+  """) every 5m json optional
+  // CPU use from the launcher's /proc/stat (all cores): busy share of the time since the last read.
+  source stat = cmd("head -1 /proc/stat") every 5s optional
+  source now = clock every 1s
+  // Animations play for 30 s after the page comes back into view (the screen turned on, back from an app or from
+  // two pages away) or after a tap, then rest on a still frame: while a canvas animates, the launcher redraws
+  // every frame, which costs it about a core.
+  state wakeAt = 0
+  on now { wakeAt = value - old > 4 ? value : wakeAt }
+  when wakeAt == 0 && now > 0 { wakeAt = now }
+  let animOn = now - wakeAt < 30
+  source m = android.media
+
+  let host = lower(replace(dev.model ?? "phone", " ", "-"))
+  let user = linux ? "root" : "user"
+  let mem = sys.memory
+  let disk = sys.storage
+  let shown = sys.display
+  let memPct = mem == null ? null : round(mem.used / mem.total * 100)
+  let diskPct = disk == null ? null : round(disk.used / disk.total * 100)
+  let jiffies = words(stat).drop(1).map(n => num(n, 0))
+  let busy = jiffies[0] + jiffies[1] + jiffies[2] + jiffies[5] + jiffies[6] + jiffies[7]
+  let ticks = busy + jiffies[3] + jiffies[4]
+  let pBusy = prev(busy)
+  let pTicks = prev(ticks)
+  let cpuPct = pTicks == null || ticks <= pTicks ? null : (busy - pBusy) / (ticks - pTicks) * 100
+  let batColor = bat.level <= 15 ? red : bat.level <= 30 ? yellow : green
+
+  // The mascot, Pix: a little handheld living on the left of the display. Its mood follows the
+  // vitals; in between it fidgets, and a tap startles it (three quick ones make it dizzy).
+  let hour = num(fmtTime(now, "H"))
+  let mood = bat.temp > 40 ? "hot" : cpuPct > 40 || memPct > 85 || diskPct > 90 ? "busy" : (hour >= 23 || hour < 7) && cpuPct < 20 ? "sleepy" : "content"
+  let dancing = m.playing == true
+  state pokeAt = -100      // the last tap on Pix, in Canvas `time`
+  state pokeNow = 0        // and in Unix seconds: `time` restarts, so an old tap could look new
+  state pokes = 0          // taps in a row, each within 1.2 s of the one before
+
+  // One grid for the whole display: Pix's pixels are the same cells as the stats' text.
+  let botCols = 52
+  let cell = min(((tileWidth ?? 364) - 24) / (botCols + 123), ((tileHeight ?? 117) - 24) / 40)
+  let fidgets = ["", "look", "wave", "read", "hop", "whistle", "", "smug"]
+  let rainbow = [red, yellow, green, cyan, magenta]
+  let steamX = [3, 11, 19]
+  let swing = [0, 1, 0, -1]
+  let jitter = [1, -1, 2, 0]
+
+  // Sprites: one letter per cell, "." is empty, colored by the palettes in the Canvas.
+  // The body: a rounded handheld with a screen (s) for its face, a d-pad (x), a grille (v) and buttons (r).
+  let botBody = [
+    "..oooooooooooooooooooooo..",
+    ".ohhhhhhhhhhhhhhhhhhhhhho.",
+    "ohbkkkkkkkkkkkkkkkkkkkkbho",
+    "ohbkggsssssssssssssssskbdo",
+    "ohbkgssssssssssssssssskbdo",
+    "ohbksssssssssssssssssskbdo",
+    "ohbksssssssssssssssssskbdo",
+    "ohbksssssssssssssssssskbdo",
+    "ohbksssssssssssssssssskbdo",
+    "ohbksssssssssssssssssskbdo",
+    "ohbksssssssssssssssssskbdo",
+    "ohbksssssssssssssssssskbdo",
+    "ohbksssssssssssssssssskbdo",
+    "ohbkkkkkkkkkkkkkkkkkkkkbdo",
+    "ohbbbbbbbbbbbbbbbbbbbbbbdo",
+    "ohbbbxbbbbbbbbbbbbbbbbrrdo",
+    "ohbbxxxbbbvbvbvbbbbrrbrrdo",
+    "ohbbbxbbbbvbvbvbbbbrrbbbdo",
+    ".ohdddddddddddddddddddddo.",
+    "..oooooooooooooooooooooo.."
+  ]
+  // Arms hang off the body's sides: o is the arm, h the hand; the 2s are the other half of a wave.
+  let armRestL = ["..oo", ".oo.", "oo..", "hh..", "hh.."]
+  let armRestR = ["oo..", ".oo.", "..oo", "..hh", "..hh"]
+  let armUpL = ["hh..", "hh..", "oo..", "oo..", ".oo.", "..oo"]
+  let armUpL2 = [".hh.", ".hh.", "oo..", "oo..", ".oo.", "..oo"]
+  let armUpR = ["..hh", "..hh", "..oo", "..oo", ".oo.", "oo.."]
+  let armUpR2 = [".hh.", ".hh.", "..oo", "..oo", ".oo.", "oo.."]
+  let bulbArt = [".ll.", "lwll", "llll", ".ll."]
+  // Eyes sit on the 18x10 screen, centered on columns 4 and 13: e glows, w is a glint.
+  let eyes = {
+    wide: ["wee", "eee", "eee", "eee"],
+    shut: ["...", "...", "eee", "..."],
+    happy: ["...", ".e.", "e.e", "..."],
+    sleep: ["...", "e.e", ".e.", "..."],
+    big: [".ee.", "e..e", "e..e", ".ee."],
+    smug: ["...", "eee", "eee", "..."],
+    heart: [".e.e.", "eeeee", ".eee.", "..e.."],
+    squintL: ["...", "e..", ".ee", "e.."],
+    squintR: ["...", "..e", "ee.", "..e"],
+    ring: ["eee", "e.e", "eee"]
+  }
+  let ringPts = [[0, 0], [1, 0], [2, 0], [2, 1], [2, 2], [1, 2], [0, 2], [0, 1]]
+  let propeller = [["e..", ".e.", "..e"], [".e.", ".e.", ".e."], ["..e", ".e.", "e.."], ["...", "eee", "..."]]
+  // Mouths, centered on column 9 and ending on row 8; r is a tongue.
+  let mouths = {
+    smile: ["e....e", ".eeee."],
+    grin: ["eeeeee", "e.rr.e", ".eeee."],
+    flat: ["eeee"],
+    wavy: ["e.e.e.", ".e.e.e"],
+    o: [".e.", "e.e", ".e."],
+    cat: ["e.e.e", ".e.e."],
+    pant: [".eee.", "e.r.e", ".eee."],
+    small: ["e..e", ".ee."]
+  }
+  let bang = ["e", "e", "e", ".", "e"]
+  let quiz = ["ee.", "..e", ".e.", "...", ".e."]
+  let note = [".ee.", ".e.e", ".e..", "ee..", "ee.."]
+  let zee = ["eeee", "..e.", ".e..", "eeee"]
+  let heart = [".e.e.", "eeeee", ".eee.", "..e.."]
+  let star = [".e.", "eee", ".e."]
+  // Headphones, worn while audio plays: the band arches a cell above the body, behind the antenna, and the
+  // cups (p) sit on the body's sides at screen height, clear of the arms; their glow follows the mood.
+  let headBand = [
+    "....bbbbbbbbbbbbbbbbbbbbbb....",
+    "..bbhhhhhhhhhhhhhhhhhhhhhhbb..",
+    ".bh........................hb.",
+    ".bh........................hb."
+  ]
+  let headCups = [
+    ".cc........................cc.",
+    "cppc......................cppc",
+    "cppc......................cppc",
+    "cppc......................cppc",
+    "cppc......................cppc",
+    ".cc........................cc."
+  ]
+  let phones = mix(background, foreground, 0.3)
+  let phonesHi = mix(background, foreground, 0.5)
+  let drop = [".e.", "eee", "eee", ".e."]
+  let puff = [".ee.", "eeee", ".ee."]
+  let bubbles = [[".e.", "e.e", ".e."], [".eee.", "e...e", "e...e", "e...e", ".eee."]]
+
+  // The stats as a dot-matrix display: a 3x5 pixel font, laid out in grid cells (121 x 36).
+  let font = {
+    " ": ["...", "...", "...", "...", "..."], "A": [".x.", "x.x", "xxx", "x.x", "x.x"], "B": ["xx.", "x.x", "xx.", "x.x", "xx."],
+    "C": [".xx", "x..", "x..", "x..", ".xx"], "D": ["xx.", "x.x", "x.x", "x.x", "xx."], "E": ["xxx", "x..", "xxx", "x..", "xxx"],
+    "F": ["xxx", "x..", "xx.", "x..", "x.."], "G": [".xx", "x..", "x.x", "x.x", ".xx"], "H": ["x.x", "x.x", "xxx", "x.x", "x.x"],
+    "I": ["xxx", ".x.", ".x.", ".x.", "xxx"], "J": ["..x", "..x", "..x", "x.x", ".x."], "K": ["x.x", "x.x", "xx.", "x.x", "x.x"],
+    "L": ["x..", "x..", "x..", "x..", "xxx"], "M": ["x.x", "xxx", "xxx", "x.x", "x.x"], "N": ["xx.", "x.x", "x.x", "x.x", "x.x"],
+    "O": [".x.", "x.x", "x.x", "x.x", ".x."], "P": ["xx.", "x.x", "xx.", "x..", "x.."], "Q": [".x.", "x.x", "x.x", "xx.", ".xx"],
+    "R": ["xx.", "x.x", "xx.", "x.x", "x.x"], "S": [".xx", "x..", ".x.", "..x", "xx."], "T": ["xxx", ".x.", ".x.", ".x.", ".x."],
+    "U": ["x.x", "x.x", "x.x", "x.x", "xxx"], "V": ["x.x", "x.x", "x.x", "x.x", ".x."], "W": ["x.x", "x.x", "xxx", "xxx", "x.x"],
+    "X": ["x.x", "x.x", ".x.", "x.x", "x.x"], "Y": ["x.x", "x.x", ".x.", ".x.", ".x."], "Z": ["xxx", "..x", ".x.", "x..", "xxx"],
+    "0": ["xxx", "x.x", "x.x", "x.x", "xxx"], "1": [".x.", "xx.", ".x.", ".x.", "xxx"], "2": ["xxx", "..x", "xxx", "x..", "xxx"],
+    "3": ["xxx", "..x", "xxx", "..x", "xxx"], "4": ["x.x", "x.x", "xxx", "..x", "..x"], "5": ["xxx", "x..", "xxx", "..x", "xxx"],
+    "6": ["xxx", "x..", "xxx", "x.x", "xxx"], "7": ["xxx", "..x", "..x", "..x", "..x"], "8": ["xxx", "x.x", "xxx", "x.x", "xxx"],
+    "9": ["xxx", "x.x", "xxx", "..x", "xxx"], "°": [".x.", "x.x", ".x.", "...", "..."], "-": ["...", "...", "xxx", "...", "..."],
+    "↑": [".x.", "xxx", ".x.", ".x.", ".x."], "↓": [".x.", ".x.", ".x.", "xxx", ".x."], ".": ["...", "...", "...", "...", ".x."],
+    ",": ["...", "...", "...", ".x.", "x.."], ":": ["...", ".x.", "...", ".x.", "..."], "/": ["..x", "..x", ".x.", "x..", "x.."],
+    "'": [".x.", ".x.", "...", "...", "..."], "(": [".x.", "x..", "x..", "x..", ".x."], ")": [".x.", "..x", "..x", "..x", ".x."],
+    "+": ["...", ".x.", "xxx", ".x.", "..."], "%": ["x.x", "..x", ".x.", "x..", "x.x"], "@": ["xxx", "x.x", "x.x", "x..", "xxx"],
+    "·": ["...", "...", ".x.", "...", "..."], "_": ["...", "...", "...", "...", "xxx"], "!": [".x.", ".x.", ".x.", "...", ".x."],
+    "?": ["xx.", "..x", ".x.", "...", ".x."], "#": ["x.x", "xxx", "x.x", "xxx", "x.x"], "&": [".x.", "x.x", ".x.", "x.x", ".xx"],
+    "=": ["...", "xxx", "...", "xxx", "..."], "<": ["..x", ".x.", "x..", ".x.", "..x"], ">": ["x..", ".x.", "..x", ".x.", "x.."],
+    "[": ["xx.", "x..", "x..", "x..", "xx."], "]": [".xx", "..x", "..x", "..x", ".xx"], "*": ["...", "x.x", ".x.", "x.x", "..."],
+    "~": ["...", ".x.", "x.x", "...", "..."], "↗": [".xx", "..x", ".x.", "x..", "..."], "À": [".x.", "x.x", "xxx", "x.x", "x.x"],
+    "Á": [".x.", "x.x", "xxx", "x.x", "x.x"], "Â": [".x.", "x.x", "xxx", "x.x", "x.x"], "Ã": [".x.", "x.x", "xxx", "x.x", "x.x"],
+    "Ä": [".x.", "x.x", "xxx", "x.x", "x.x"], "Å": [".x.", "x.x", "xxx", "x.x", "x.x"], "Ç": [".xx", "x..", "x..", "x..", ".xx"],
+    "È": ["xxx", "x..", "xxx", "x..", "xxx"], "É": ["xxx", "x..", "xxx", "x..", "xxx"], "Ê": ["xxx", "x..", "xxx", "x..", "xxx"],
+    "Ë": ["xxx", "x..", "xxx", "x..", "xxx"], "Ì": ["xxx", ".x.", ".x.", ".x.", "xxx"], "Í": ["xxx", ".x.", ".x.", ".x.", "xxx"],
+    "Î": ["xxx", ".x.", ".x.", ".x.", "xxx"], "Ï": ["xxx", ".x.", ".x.", ".x.", "xxx"], "Ñ": ["xx.", "x.x", "x.x", "x.x", "x.x"],
+    "Ò": [".x.", "x.x", "x.x", "x.x", ".x."], "Ó": [".x.", "x.x", "x.x", "x.x", ".x."], "Ô": [".x.", "x.x", "x.x", "x.x", ".x."],
+    "Õ": [".x.", "x.x", "x.x", "x.x", ".x."], "Ö": [".x.", "x.x", "x.x", "x.x", ".x."], "Ù": ["x.x", "x.x", "x.x", "x.x", "xxx"],
+    "Ú": ["x.x", "x.x", "x.x", "x.x", "xxx"], "Û": ["x.x", "x.x", "x.x", "x.x", "xxx"], "Ü": ["x.x", "x.x", "x.x", "x.x", "xxx"],
+    "Ý": ["x.x", "x.x", ".x.", ".x.", ".x."]
+  }
+  let unknownGlyph = ["x.x", ".x.", "x.x", ".x.", "x.x"]
+  let up = sys.uptime == null ? "" : upper("up ${fmtDuration(sys.uptime)}")
+  // Each text at x, y (top left, in cells) and scale k; a character advances 4k cells.
+  let lcd = [
+    {t: "PHONE", x: 1, y: 3, k: 1, c: accent},
+    {t: up, x: 121 - len(up) * 4, y: 3, k: 1, c: muted},
+    {t: cpuPct == null ? "--%" : "${round(cpuPct)}%", x: 1, y: 14, k: 2, c: cpuPct > 80 ? red : foreground},
+    {t: memPct == null ? "--%" : "${memPct}%", x: 31, y: 14, k: 2, c: memPct > 85 ? red : foreground},
+    {t: diskPct == null ? "--%" : "${diskPct}%", x: 61, y: 14, k: 2, c: diskPct > 90 ? red : foreground},
+    {t: bat.temp == null ? "--°" : "${round(bat.temp)}°", x: 91, y: 14, k: 2, c: bat.temp > 40 ? red : foreground},
+    {t: "CPU", x: 1, y: 28, k: 1, c: muted},
+    {t: "MEMORY", x: 31, y: 28, k: 1, c: muted},
+    {t: "DISK", x: 61, y: 28, k: 1, c: muted},
+    {t: "TEMP", x: 91, y: 28, k: 1, c: muted}
+  ]
+
+  // The full screen, in the same dot-matrix as the tile: 160 cells across. Each info line is 8 rows: a
+  // key, then its value, wrapped at 30 characters (three lines at most); a section gets a blank line first.
+  let scrCols = 160
+  let pal16 = [color0, color1, color2, color3, color4, color5, color6, color7, color8, color9, color10, color11, color12, color13, color14, color15]
+  let vit = [
+    {t: cpuPct == null ? "--%" : "${round(cpuPct)}%", l: "CPU", c: cpuPct > 80 ? red : foreground},
+    {t: memPct == null ? "--%" : "${memPct}%", l: "MEMORY", c: memPct > 85 ? red : foreground},
+    {t: diskPct == null ? "--%" : "${diskPct}%", l: "DISK", c: diskPct > 90 ? red : foreground},
+    {t: bat.temp == null ? "--°" : "${round(bat.temp)}°", l: "TEMP", c: bat.temp > 40 ? red : foreground},
+    {t: bat == null ? "--%" : "${bat.level}%", l: bat.charging ? "CHARGING" : "BATTERY", c: batColor}
+  ]
+  let sectionsRaw = [
+    ["PHONE", [
+      ["HOST", dev == null ? null : "${dev.maker} ${dev.model} (${sys.codename})"],
+      ["ANDROID", dev == null ? null : "${dev.android} (sdk ${dev.sdk})"],
+      ["SECURITY", sys.patch],
+      ["BUILD", sys.build],
+      ["KERNEL", sys.kernel],
+      ["UPTIME", sys.uptime == null ? null : fmtDuration(sys.uptime)],
+      ["LOCALE", sys.locale == null ? null : "${sys.locale} · ${sys.timezone}"]
+    ]],
+    ["HARDWARE", [
+      ["CPU", sys.cpu == null ? null : trim("${sys.cpu.maker} ${sys.cpu.soc == "" ? sys.cpu.hardware : sys.cpu.soc}")],
+      ["CORES", sys.cpu == null ? null : "${sys.cpu.cores} · ${sys.cpu.abi}${!sys.cpu.maxMhz ? "" : " · up to ${fixed(sys.cpu.maxMhz / 1000, 2)} GHz"}"],
+      ["DISPLAY", shown.width == null ? null : "${shown.width}x${shown.height} @ ${shown.hz}Hz · ${shown.dpi} dpi"],
+      ["MEMORY", mem == null ? null : "${fmtBytes(mem.used)} / ${fmtBytes(mem.total)} (${memPct}%)"],
+      ["STORAGE", disk == null ? null : "${fmtBytes(disk.used)} / ${fmtBytes(disk.total)} (${diskPct}%)"]
+    ]],
+    ["BATTERY", [
+      ["LEVEL", bat == null ? null : "${bat.level}% · ${bat.status}${bat.plugged == null ? "" : " (" + bat.plugged + ")"}"],
+      ["TEMP", bat.temp == null ? null : "${fixed(bat.temp, 1)}°C"],
+      ["VOLTAGE", bat.voltage == null ? null : "${fixed(bat.voltage, 2)} V"],
+      ["HEALTH", bat.health],
+      ["CYCLES", bat.cycles],
+      ["TECH", bat.technology]
+    ]],
+    ["LAUNCHER", [
+      ["VERSION", sys.launcher],
+      ["THEME", sys.theme ?? "default"],
+      ["APPS", sys.apps == null ? null : "${sys.apps} android apps"]
+    ]],
+    ["LINUX", [
+      ["OS", linux ? lx.os : "not installed"],
+      ["PACKAGES", linux && lx.pkgs != null ? "${lx.pkgs} (${lx.explicit} explicit)" : null],
+      ["SHELL", linux ? lx.shell : null],
+      ["UPGRADED", linux ? (lx.upgraded == "" ? "never" : lx.upgraded) : null]
+    ]]
+  ]
+  let sections = sectionsRaw.map(sec => {h: sec[0], lines: flatten(sec[1].filter(e => e[1] != null).map(e => range(clamp(ceil(len(str(e[1])) / 30), 1, 3)).map(c => {k: c == 0 ? e[0] : "", v: upper(sub(str(e[1]), c * 30, min(len(str(e[1])), c * 30 + 30)))})))})
+
+  onTap: { wakeAt = now; screen() }
+
+  // The tile shows the phone's vitals; Arch and the rest are a tap away, on the screen.
+  Row {
+    gap: 0
+    align: center
+    // Pix on its own canvas, so only it animates; its panel and grid run on into the stats'.
+    Canvas {
+      width: botCols * cell
+      fill: height
+      onTap: {
+        wakeAt = now
+        pokes = time - pokeAt < 1.2 ? pokes + 1 : 1
+        pokeAt = time
+        pokeNow = now
+      }
+      let tt = animOn ? time : 2.2
+      let p = cell
+      let rowsN = floor(height / p)
+      let since = tt >= pokeAt && now - pokeNow < 6 ? tt - pokeAt : 1000
+      // What it's doing: a tap wins, then the mood, music, sleep; otherwise it fidgets.
+      let act = since < 3.5 && pokes >= 3 ? "dizzy" : since < 0.8 ? "poked" : since < 2.6 ? "giggle" : mood == "hot" ? "hot" : mood == "busy" ? "busy" : dancing ? "dance" : mood == "sleepy" ? "sleepy" : "idle"
+      // A new fidget every 7 s, in a jumbled order; now and then the screen glitches.
+      let slot = floor(tt / 7)
+      let ph = tt % 7
+      let glitch = act == "idle" && slot % 13 == 9 && ph >= 3 && ph < 3.45
+      let sheepish = act == "idle" && slot % 13 == 9 && ph >= 3.45 && ph < 5.2
+      let doing = act != "idle" || glitch || sheepish || ph < 0.5 || ph > 5.6 ? "" : fidgets[(slot * 5 + floor(slot / 3)) % 8]
+
+      // Hops: squash, up, squash, wobble; twice when fidgeting, once (smaller) when startled.
+      let hu = doing == "hop" ? (ph >= 1 && ph < 2.4 ? ph - 1 : ph >= 2.6 && ph < 4 ? ph - 2.6 : -1) : act == "poked" ? since : -1
+      let squash = hu >= 0 && (hu < 0.12 || (hu >= 0.72 && hu < 0.85))
+      let air = hu >= 0.12 && hu < 0.72
+      let lift = air ? round(sin((hu - 0.12) / 0.6 * 3.1416) * (act == "poked" ? 3 : 5)) : 0
+      // It breathes (the body sinks a cell), slower asleep; asleep it also nods off and jolts awake.
+      let breath = act == "sleepy" ? floor(tt / 1.6) % 2 : act == "dance" ? floor(tt * 2.5) % 2 : floor(tt / 0.9) % 2
+      let nod = act == "sleepy" && tt % 9 >= 7.6 && tt % 9 < 8.5
+      let jolt = act == "sleepy" && tt % 9 >= 8.5 && tt % 9 < 8.9
+      let legLen = air ? 4 : squash || nod ? 1 : 3 - breath
+      let sway = act == "dance" || act == "dizzy" ? swing[floor(tt * (act == "dance" ? 2.5 : 3)) % 4] : act == "giggle" ? floor(tt * 12) % 2 : doing == "read" ? 1 : glitch ? jitter[floor(tt * 20) % 4] : 0
+      let bx = floor((botCols - 26) / 2) + sway
+      let gy = rowsN - 3
+      let ty = gy - lift - legLen - 19
+      // The antenna lags behind: it swings after a landing and leans against the dance.
+      let wob = hu >= 0.72 && hu < 1.4 ? round(sin(hu * 22) * 2.5 * (1.4 - hu)) : act == "dance" || act == "dizzy" ? -sway : 0
+
+      let tint = act == "hot" ? mix(accent, red, 0.45) : accent
+      let shade = mix(tint, background, 0.55)
+      let hand = mix(tint, foreground, 0.35)
+      let glow = act == "hot" ? orange : act == "busy" ? yellow : act == "sleepy" ? muted : act == "poked" || act == "giggle" ? magenta : act == "dance" ? green : cyan
+      let bulb = act == "busy" ? (floor(tt * 4) % 2 == 0 ? yellow : shade) : act == "hot" ? red : act == "sleepy" ? alpha(muted, 0.4 + 0.3 * abs(sin(tt))) : act == "dizzy" || act == "dance" ? rainbow[floor(tt * 8) % 5] : act == "poked" || act == "giggle" ? magenta : alpha(green, 0.55 + 0.45 * abs(sin(tt * 1.5)))
+      let flick = floor(tt * (act == "hot" ? 10 : 6)) % 2 == 0
+      let tapping = doing == "whistle" && floor(tt * 3) % 2 == 0
+
+      // The panel, and Pix's shadow, which shrinks as it jumps.
+      rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+      rect((bx + 4 + floor(lift / 2)) * p, (gy + 1) * p, (18 - 2 * floor(lift / 2)) * p, p, fill: alpha(foreground, 0.12))
+      // Legs: a stem down from the body and a foot; whistling, it taps the left one.
+      for lx in [6, 17] {
+        let raise = tapping && lx == 6 ? 1 : 0
+        rect((bx + lx + 1) * p, (ty + 20) * p, 2 * p, (legLen - 1 - raise) * p, fill: shade)
+        rect((bx + lx) * p, (gy - lift - raise) * p, 4 * p, p, fill: shade)
+      }
+      // Arms: resting, typing (busy), waving, fanning (hot), both up (startled), taking turns (dance).
+      let upR = (doing == "wave" && ph > 0.8 && ph < 3.6) || act == "hot" || act == "poked" || (act == "dance" && floor(tt * 2.5) % 2 == 0)
+      let upL = act == "poked" || (act == "dance" && floor(tt * 2.5) % 2 == 1)
+      let typing = act == "busy" ? floor(tt * 8) % 2 : 0
+      sprite(upL ? (flick ? armUpL : armUpL2) : armRestL, (bx - 4) * p, (upL ? ty + 3 : ty + 9 - typing) * p, p, palette: {o: shade, h: hand})
+      sprite(upR ? (flick ? armUpR : armUpR2) : armRestR, (bx + 26) * p, (upR ? ty + 3 : ty + 9 - (act == "busy" ? 1 - typing : 0)) * p, p, palette: {o: shade, h: hand})
+      if dancing {
+        sprite(headBand, (bx - 2) * p, (ty - 3) * p, p, palette: {b: phones, h: phonesHi})
+      }
+      // The antenna: four stem cells that bend toward the tip, and a bulb that shows the mood.
+      for k in range(4) {
+        rect((bx + 12 + round(wob * (4 - k) / 4)) * p, (ty - 4 + k) * p, 2 * p, p, fill: shade)
+      }
+      sprite(bulbArt, (bx + 11 + wob) * p, (ty - 8) * p, p, palette: {l: bulb, w: alpha(foreground, 0.7)})
+      sprite(botBody, bx * p, ty * p, p, palette: {o: shade, b: tint, h: hand, d: mix(tint, background, 0.25), k: mix(background, tint, 0.18), s: background, g: alpha(foreground, act == "sleepy" ? 0.15 : 0.45), x: shade, v: shade, r: act == "busy" && flick ? yellow : magenta})
+
+      if dancing {
+        sprite(headCups, (bx - 2) * p, (ty + 1) * p, p, palette: {c: phones, p: act == "dance" && breath == 1 ? mix(glow, background, 0.35) : glow})
+      }
+
+      // The face, on the screen: a faint backlight, cheeks, eyes and a mouth.
+      let fx = bx + 4 + (glitch ? jitter[(floor(tt * 20) + 1) % 4] : 0)
+      let fy = ty + 3
+      rect((bx + 4) * p, fy * p, 18 * p, 10 * p, fill: alpha(glow, act == "sleepy" ? 0.03 : 0.08))
+      if act == "giggle" || act == "poked" || act == "dance" || act == "hot" || doing == "wave" || sheepish {
+        rect((fx + 1) * p, (fy + 6) * p, 2 * p, p, fill: alpha(act == "hot" ? red : magenta, 0.75))
+        rect((fx + 15) * p, (fy + 6) * p, 2 * p, p, fill: alpha(act == "hot" ? red : magenta, 0.75))
+      }
+      let blink = act == "idle" && (tt % 3.7 < 0.12 || tt % 11.3 < 0.12 || (tt % 11.3 > 0.25 && tt % 11.3 < 0.37))
+      let lookX = doing == "look" ? (ph < 2 ? -1 : ph < 3.5 ? 1 : 0) : doing == "read" ? 1 : doing == "smug" ? -1 : act == "dance" ? sway : 0
+      let lookY = doing == "look" && ph >= 3.5 && ph < 4.6 ? -1 : doing == "read" ? floor(ph * 1.5) % 2 : 0
+      if act == "busy" {
+        // Loading spinners, turning opposite ways.
+        for c in [4, 13] {
+          let k = c == 4 ? floor(tt * 10) % 8 : (8 - floor(tt * 10) % 8) % 8
+          sprite(eyes.ring, (fx + c - 1) * p, (fy + 3) * p, p, color: alpha(glow, 0.3))
+          rect((fx + c - 1 + ringPts[k].0) * p, (fy + 3 + ringPts[k].1) * p, p, p, fill: glow)
+        }
+      }
+      if act == "dizzy" {
+        // Propellers, counter-rotating.
+        sprite(propeller[floor(tt * 10) % 4], (fx + 3) * p, (fy + 3) * p, p, color: glow)
+        sprite(propeller[3 - floor(tt * 10) % 4], (fx + 12) * p, (fy + 3) * p, p, color: glow)
+      }
+      if act != "busy" && act != "dizzy" {
+        let eyeL = act == "poked" || jolt ? eyes.big : act == "giggle" && since > 1.5 ? eyes.heart : act == "giggle" || act == "dance" || sheepish || (doing == "wave" && ph > 1.2 && ph < 3.2) || (doing == "hop" && air) ? eyes.happy : act == "hot" ? eyes.squintL : act == "sleepy" ? (nod ? eyes.shut : eyes.sleep) : doing == "smug" ? eyes.smug : blink ? eyes.shut : eyes.wide
+        let eyeR = act == "hot" ? eyes.squintR : eyeL
+        if glitch {
+          // Chromatic split and static lines.
+          sprite(eyes.wide, (fx + 2) * p, (fy + 2) * p, p, color: alpha(red, 0.6))
+          sprite(eyes.wide, (fx + 13) * p, (fy + 2) * p, p, color: alpha(cyan, 0.6))
+          for k in range(3) {
+            rect((bx + 4) * p, (fy + (floor(tt * 37) + k * 4) % 10) * p, 18 * p, p, fill: alpha(foreground, 0.22))
+          }
+        }
+        sprite(eyeL, (fx + 4 - floor(len(eyeL[0]) / 2) + lookX) * p, (fy + 2 + lookY) * p, p, palette: {e: act == "giggle" && since > 1.5 ? magenta : glow, w: alpha(foreground, 0.9)})
+        sprite(eyeR, (fx + 13 - floor(len(eyeR[0]) / 2) + lookX) * p, (fy + 2 + lookY) * p, p, palette: {e: act == "giggle" && since > 1.5 ? magenta : glow, w: alpha(foreground, 0.9)})
+      }
+      let mouth = act == "poked" || act == "sleepy" || doing == "whistle" ? mouths.o : act == "giggle" || act == "dance" || doing == "wave" || (doing == "hop" && air) ? mouths.grin : act == "hot" ? (floor(tt * 4) % 2 == 0 ? mouths.pant : mouths.o) : act == "busy" || act == "dizzy" ? mouths.wavy : doing == "read" || glitch ? mouths.flat : doing == "smug" ? mouths.cat : sheepish ? mouths.small : mouths.smile
+      sprite(mouth, (fx + 9 - floor(len(mouth[0]) / 2) + lookX + (doing == "whistle" ? 1 : 0)) * p, (fy + 9 - len(mouth)) * p, p, palette: {e: glow, r: red})
+
+      // Around it: what it's up to.
+      if act == "poked" {
+        sprite(bang, (bx + 20) * p, (ty - 12 + (since < 0.2 ? 1 : 0)) * p, p, color: yellow)
+      }
+      if doing == "read" && ph > 2.5 && ph < 4.5 {
+        sprite(quiz, (bx + 21) * p, (ty - 11) * p, p, color: foreground)
+      }
+      if doing == "whistle" || act == "dance" {
+        for k in range(2) {
+          let t = (tt * 0.6 + k * 0.5) % 1
+          sprite(note, (bx + 19 + k * 4 + round(t * 5)) * p, (ty - 1 - round(t * 11)) * p, p, color: alpha(act == "dance" ? green : yellow, 1 - t))
+        }
+      }
+      if act == "sleepy" {
+        for k in range(2) {
+          let t = (tt * 0.3 + k * 0.5) % 1
+          sprite(zee, (bx + 21 + round(t * 6)) * p, (ty - 3 - round(t * 12)) * p, p, color: alpha(muted, 1 - t))
+        }
+        // A bubble at the corner of its mouth grows with its breath, then pops.
+        let bt = tt % 6
+        if bt < 4.8 {
+          let bub = bt < 2 ? bubbles.0 : bubbles.1
+          sprite(bub, (fx + 11) * p, (fy + 10 - len(bub)) * p, p, color: alpha(cyan, 0.75))
+        }
+        if bt >= 4.8 && bt < 5.3 {
+          sprite(star, (fx + 12) * p, (fy + 6) * p, p, color: alpha(foreground, 0.6))
+        }
+      }
+      if act == "hot" {
+        for k in range(3) {
+          let t = (tt * 0.7 + k / 3) % 1
+          sprite(puff, (bx + steamX[k] + round(sin(tt * 3 + k))) * p, (ty - 2 - round(t * 9)) * p, p, color: alpha(foreground, 0.45 * (1 - t)))
+        }
+      }
+      if act == "hot" || act == "busy" {
+        sprite(drop, (bx - 3) * p, (ty + 1 + floor((tt * 1.5) % 1 * 7)) * p, p, color: cyan)
+      }
+      if sheepish {
+        sprite(drop, (bx + 26) * p, (ty + 2) * p, p, color: cyan)
+      }
+      if act == "giggle" {
+        let u = (since - 0.8) / 1.8
+        sprite(heart, (bx - 4) * p, (ty + 4 - round(u * 9)) * p, p, color: alpha(magenta, 1 - u))
+        sprite(heart, (bx + 25) * p, (ty + 2 - round(u * 9)) * p, p, color: alpha(magenta, 1 - u))
+      }
+      if act == "dizzy" {
+        for k in range(3) {
+          let a = tt * 5 + k * 2.094
+          sprite(star, (bx + 12 + round(cos(a) * 11)) * p, (ty - 10 + round(sin(a) * 2)) * p, p, color: yellow)
+        }
+      }
+      for i in range(botCols + 1) { line(i * p, 0, i * p, height, stroke: background, width: 0.35) }
+      for j in range(rowsN + 1) { line(0, j * p, width, j * p, stroke: background, width: 0.35) }
+    }
+    Canvas {
+      weight: 1
+      fill: height
+      // The stats in the same cells as Pix, the layout centered; unlit cells show as a faint panel cut by the grid lines.
+      let p = min(cell, min(width / 121, height / 36))
+      let ox = floor((width / p - 121) / 2)
+      let oy = floor((height / p - 36) / 2)
+      rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+      for it in lcd {
+        for i in range(len(it.t)) {
+          sprite(get(font, sub(it.t, i, i + 1), unknownGlyph), (ox + it.x + i * 4 * it.k) * p, (oy + it.y) * p, p * it.k, color: it.c)
+        }
+      }
+      for i in range(floor(width / p) + 1) { line(i * p, 0, i * p, height, stroke: background, width: 0.35) }
+      for j in range(floor(height / p) + 1) { line(0, j * p, width, j * p, stroke: background, width: 0.35) }
+    }
+  }
+
+  screen {
+    title: "phone"
+    Column {
+      scroll: true
+      gap: 0
+      // Pix, and whose phone this is.
+      Canvas {
+        fill: width
+        height: 44 * screenWidth / scrCols
+        let tt = animOn ? time : 2.2
+        let p = width / scrCols
+        let rowsN = floor(height / p)
+        let name = upper("${user}@${host}")
+        let nk = len(name) <= 15 ? 2 : 1
+        let lines2 = [{t: upper("omalauncher ${sys.launcher ?? ""}"), y: 22}, {t: upper(sys.theme ?? "default"), y: 29}]
+        rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+        // Idle: breathing a cell, blinking now and then, the antenna light pulsing.
+        let bx = 6
+        let breath = floor(tt / 0.9) % 2
+        let ty = 12 + breath
+        let shade = mix(accent, background, 0.55)
+        let hand = mix(accent, foreground, 0.35)
+        let blink = tt % 3.7 < 0.12
+        rect((bx + 4) * p, 34 * p, 18 * p, p, fill: alpha(foreground, 0.12))
+        for lx in [6, 17] {
+          rect((bx + lx + 1) * p, (ty + 20) * p, 2 * p, (3 - breath) * p, fill: shade)
+          rect((bx + lx) * p, 35 * p, 4 * p, p, fill: shade)
+        }
+        sprite(armRestL, (bx - 4) * p, (ty + 9) * p, p, palette: {o: shade, h: hand})
+        sprite(armRestR, (bx + 26) * p, (ty + 9) * p, p, palette: {o: shade, h: hand})
+        if dancing {
+          sprite(headBand, (bx - 2) * p, (ty - 3) * p, p, palette: {b: phones, h: phonesHi})
+        }
+        for k in range(4) {
+          rect((bx + 12) * p, (ty - 4 + k) * p, 2 * p, p, fill: shade)
+        }
+        sprite(bulbArt, (bx + 11) * p, (ty - 8) * p, p, palette: {l: alpha(green, 0.55 + 0.45 * abs(sin(tt * 1.5))), w: alpha(foreground, 0.7)})
+        sprite(botBody, bx * p, ty * p, p, palette: {o: shade, b: accent, h: hand, d: mix(accent, background, 0.25), k: mix(background, accent, 0.18), s: background, g: alpha(foreground, 0.45), x: shade, v: shade, r: magenta})
+        if dancing {
+          sprite(headCups, (bx - 2) * p, (ty + 1) * p, p, palette: {c: phones, p: cyan})
+        }
+        rect((bx + 4) * p, (ty + 3) * p, 18 * p, 10 * p, fill: alpha(cyan, 0.08))
+        sprite(blink ? eyes.shut : eyes.wide, (bx + 7) * p, (ty + 5) * p, p, palette: {e: cyan, w: alpha(foreground, 0.9)})
+        sprite(blink ? eyes.shut : eyes.wide, (bx + 16) * p, (ty + 5) * p, p, palette: {e: cyan, w: alpha(foreground, 0.9)})
+        sprite(mouths.smile, (bx + 10) * p, (ty + 10) * p, p, palette: {e: cyan})
+        // Who and what.
+        for j in range(len(name)) {
+          sprite(get(font, sub(name, j, j + 1), unknownGlyph), (40 + j * 4 * nk) * p, 6 * p, nk * p, color: sub(name, j, j + 1) == "@" ? muted : accent)
+        }
+        for ln in lines2 {
+          for j in range(len(ln.t)) {
+            sprite(get(font, sub(ln.t, j, j + 1), unknownGlyph), (40 + j * 4) * p, ln.y * p, p, color: muted)
+          }
+        }
+        for i in range(16) {
+          rect((40 + (i % 8) * 5) * p, (36 + floor(i / 8) * 3) * p, 4 * p, 2 * p, fill: pal16[i])
+        }
+        path(range(2 * (scrCols + 1)).map(n => [floor(n / 2) * p, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+        path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * p]), stroke: background, width: 0.35)
+      }
+      // The vitals, as on the tile, plus the battery.
+      Canvas {
+        fill: width
+        height: 26 * screenWidth / scrCols
+        let p = width / scrCols
+        let rowsN = floor(height / p)
+        rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+        for i in range(len(vit)) {
+          let v = vit[i]
+          for j in range(len(v.t)) {
+            sprite(get(font, sub(v.t, j, j + 1), unknownGlyph), (1 + i * 31 + j * 8) * p, 4 * p, 2 * p, color: v.c)
+          }
+          for j in range(len(v.l)) {
+            sprite(get(font, sub(v.l, j, j + 1), unknownGlyph), (1 + i * 31 + j * 4) * p, 17 * p, p, color: muted)
+          }
+        }
+        path(range(2 * (scrCols + 1)).map(n => [floor(n / 2) * p, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+        path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * p]), stroke: background, width: 0.35)
+      }
+      // Everything else, a canvas per section (each run of lit cells is a draw call, 2000 a frame per canvas):
+      // a heading and its rule, then keys and their values.
+      for sec in sections {
+        Canvas {
+          fill: width
+          height: (14 + len(sec.lines) * 8) * screenWidth / scrCols
+          let p = width / scrCols
+          let rowsN = floor(height / p)
+          rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+          for j in range(len(sec.h)) {
+            sprite(get(font, sub(sec.h, j, j + 1), unknownGlyph), (2 + j * 4) * p, 4 * p, p, color: accent)
+          }
+          rect((4 + len(sec.h) * 4) * p, 6 * p, (154 - len(sec.h) * 4) * p, p, fill: alpha(muted, 0.35))
+          for i in range(len(sec.lines)) {
+            let ln = sec.lines[i]
+            for j in range(len(ln.k)) {
+              sprite(get(font, sub(ln.k, j, j + 1), unknownGlyph), (2 + j * 4) * p, (12 + i * 8) * p, p, color: muted)
+            }
+            for j in range(len(ln.v)) {
+              sprite(get(font, sub(ln.v, j, j + 1), unknownGlyph), (38 + j * 4) * p, (12 + i * 8) * p, p, color: foreground)
+            }
+          }
+          path(range(2 * (scrCols + 1)).map(n => [floor(n / 2) * p, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+          path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * p]), stroke: background, width: 0.35)
+        }
+      }
+      // A pixel button: fastfetch in a terminal, or the sheet that installs Linux.
+      if linux {
+        Canvas {
+          fill: width
+          height: 20 * screenWidth / scrCols
+          onTap: terminal("command -v fastfetch >/dev/null || pacman -S --needed --noconfirm fastfetch; fastfetch", "fastfetch")
+          let p = width / scrCols
+          let rowsN = floor(height / p)
+          let t = "FASTFETCH ↗"
+          let bx = 158 - len(t) * 4 - 6
+          rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+          rect(bx * p, 4 * p, (len(t) * 4 + 7) * p, 11 * p, fill: alpha(accent, 0.18))
+          for j in range(len(t)) {
+            sprite(get(font, sub(t, j, j + 1), unknownGlyph), (bx + 4 + j * 4) * p, 7 * p, p, color: accent)
+          }
+          path(range(2 * (scrCols + 1)).map(n => [floor(n / 2) * p, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+          path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * p]), stroke: background, width: 0.35)
+        }
+      } else {
+        Canvas {
+          fill: width
+          height: 20 * screenWidth / scrCols
+          onTap: launcher("linux")
+          let p = width / scrCols
+          let rowsN = floor(height / p)
+          let t = "INSTALL LINUX"
+          let bx = 158 - len(t) * 4 - 6
+          rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+          rect(bx * p, 4 * p, (len(t) * 4 + 7) * p, 11 * p, fill: alpha(accent, 0.18))
+          for j in range(len(t)) {
+            sprite(get(font, sub(t, j, j + 1), unknownGlyph), (bx + 4 + j * 4) * p, 7 * p, p, color: accent)
+          }
+          path(range(2 * (scrCols + 1)).map(n => [floor(n / 2) * p, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+          path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * p]), stroke: background, width: 0.35)
+        }
+      }
+    }
+  }
+}

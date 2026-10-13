@@ -1,0 +1,2189 @@
+widget "today" {
+  page: 1
+  order: 1
+  size: 6x2
+  minSize: 6x2
+  padding: 12
+  meta { description: "The date and the weather where you are, from wttr.in and Open-Meteo, located by IP, or at a place you search for. Tap it for hourly charts, five days, wind, UV, the sun and moon, and Pierrot on the moon"; version: "2.0"; license: "MIT"; category: "world"; owl: 5 }
+
+  source now = clock every 1m
+  // Animations play for 30 s after the page comes back into view (the screen turned on, back from an app or from
+  // two pages away) or after a tap, then rest on a still frame: while a canvas animates, the launcher redraws
+  // every frame, which costs it more than a core.
+  source wakeClock = clock every 1s
+  state wakeAt = 0
+  on wakeClock { wakeAt = value - old > 4 ? value : wakeAt }
+  when wakeAt == 0 && wakeClock > 0 { wakeAt = wakeClock }
+  let animOn = wakeClock - wakeAt < 30
+  // Where you are: ipinfo.io's coordinates follow you by network (wttr's own IP guess wanders between districts),
+  // and a place picked on the full screen overrides them. Widgets can't read GPS (yet: omalauncher issue #31).
+  // Icons and °F countries match omarchy's weather panel.
+  source geo = http("https://ipinfo.io/json") every 30m timeout 10s json
+  state place = "" persist
+  // Picking a place: the screen's box searches Photon (OpenStreetMap's place names, forgiving of typos) for
+  // cities and towns and lists them under it, cities first; tapping one pins its coordinates and its name.
+  state query = ""
+  state placeName = "" persist
+  // Typing searches by itself a second or two after the last key (a search refreshes every source, as nothing
+  // narrower exists); the keyboard's send key searches at once.
+  state searchAt = 0
+  at searchAt { refresh() }
+  source found = http("https://photon.komoot.io/api/?q=${replace(trim(query), " ", "+")}&limit=8&lang=en&layer=city", {"User-Agent": "omalauncher-weather-widget (+https://github.com/asaidaoui-netria/omalauncher-widgets)"}) every 1h timeout 10s json status
+  let hits = (found.ok ? found.out.features ?? [] : []).map(f => {name: f.properties.name, kind: f.properties.osm_value, lat: fixed(f.geometry.coordinates[1], 4), lon: fixed(f.geometry.coordinates[0], 4), label: replace(join([f.properties.name, f.properties.state, f.properties.country].filter(x => x != null && x != ""), ", "), "–", "-")})
+  let ranked = hits.filter(h => h.kind == "city") + hits.filter(h => h.kind != "city")
+  let picks = unique(ranked.map(h => h.label)).take(5).map(l => ranked.find(h => h.label == l))
+  source wx = http("https://wttr.in/${place != "" ? replace(trim(place), " ", "+") : geo.loc ?? ""}?format=j1") every 15m timeout 10s json
+  let cur = wx.current_condition[0]
+  let day = wx.weather[0]
+  let area = wx.nearest_area[0]
+  // wttr's nearest area is often a district or a region miles off, so name the place ourselves:
+  // OpenStreetMap's town at ipinfo's coordinates, the picked name for a pinned place.
+  let spot = split(geo.loc ?? "0,0", ",").map(x => fixed(num(x), 3))
+  source named = http("https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=10&accept-language=en&lat=${spot[0]}&lon=${spot[1]}", {"User-Agent": "omalauncher-weather-widget (+https://github.com/asaidaoui-netria/omalauncher-widgets)"}) every 30m timeout 10s json
+  let osm = named.address.city ?? named.address.town ?? named.address.village ?? named.address.county
+  let town = place == "" ? osm ?? geo.city ?? area.areaName[0].value : placeName != "" ? placeName : area.areaName[0].value
+  let imperial = contains(["united states", "united states of america", "liberia", "myanmar", "burma"], lower(trim(area.country[0].value)))
+  let unit = imperial ? "F" : "C"
+  let night = contains(cur.weatherIconUrl[0].value, "_night")
+  let hourNow = num(fmtTime(now, "H"))
+  // The day list: wttr's three days (as on the tile), then Open-Meteo's at the same place for days
+  // four and five, since wttr stops at three. Its WMO weather codes map to wttr's for weatherIcon.
+  // A picked place is pinned as "lat,lon", so Open-Meteo gets its coordinates at once (a name pinned by an
+  // older version uses wttr's).
+  let pinAt = match(place, "^(-?[0-9.]+),(-?[0-9.]+)$")
+  let coords = place != "" ? (pinAt ?? [area.latitude, area.longitude]) : split(geo.loc ?? ",", ",")
+  // Changing the place or the coordinates doesn't refetch by itself (it waits for each source's next fetch), so
+  // fetch now when either moves.
+  state fetchedFor = ""
+  let fetchKey = "${place}|${coords[0]},${coords[1]}"
+  when coords[0] != null && coords[0] != "" && fetchKey != fetchedFor { fetchedFor = fetchKey; refresh() }
+  source om = http("https://api.open-meteo.com/v1/forecast?latitude=${coords[0]}&longitude=${coords[1]}&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=5${imperial ? "&temperature_unit=fahrenheit" : ""}") every 1h timeout 10s json status
+  // Hourly for the next 48 hours, in Unix time so the hours land on the phone's clock (wttr's can be an hour off).
+  source omh = http("https://api.open-meteo.com/v1/forecast?latitude=${coords[0]}&longitude=${coords[1]}&hourly=temperature_2m,precipitation_probability,precipitation,weather_code,uv_index,wind_speed_10m,wind_direction_10m,wind_gusts_10m,relative_humidity_2m,dew_point_2m,pressure_msl,visibility,is_day&forecast_hours=48&timeformat=unixtime${imperial ? "&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch" : ""}") every 30m timeout 10s json status
+  let wmo = {
+    "0": "113", "1": "113", "2": "116", "3": "122", "45": "248", "48": "260",
+    "51": "266", "53": "266", "55": "266", "56": "281", "57": "284",
+    "61": "296", "63": "302", "65": "308", "66": "311", "67": "314",
+    "71": "326", "73": "332", "75": "338", "77": "326",
+    "80": "353", "81": "356", "82": "359", "85": "368", "86": "371",
+    "95": "386", "96": "389", "99": "389"
+  }
+  let daily = om.ok == true ? om.out.daily : null
+  let hr0 = omh.ok == true ? omh.out.hourly : null
+  let hourly = hr0 == null || len(hr0.time ?? []) == 0 ? null : range(len(hr0.time)).map(i => {
+    t: hr0.time[i],
+    temp: round(hr0.temperature_2m[i]),
+    pop: hr0.precipitation_probability[i] ?? 0,
+    mm: hr0.precipitation[i] ?? 0,
+    code: get(wmo, str(hr0.weather_code[i]), "116"),
+    uv: hr0.uv_index[i] ?? 0,
+    ws: round(hr0.wind_speed_10m[i]),
+    wd: hr0.wind_direction_10m[i] ?? 0,
+    wg: round(hr0.wind_gusts_10m[i]),
+    rh: hr0.relative_humidity_2m[i],
+    dp: round(hr0.dew_point_2m[i]),
+    p: hr0.pressure_msl[i],
+    vis: hr0.visibility[i] ?? 0,
+    day: hr0.is_day[i] == 1
+  })
+  // A fetch that failed or came back empty would otherwise leave days or hours missing until the next one:
+  // while either is missing, try again every two minutes (only while the page is on screen).
+  state detail = ""
+  state openedAt = -100
+  state hScroll = 0
+  let omMissing = (daily == null || hourly == null) && coords[0] != ""
+  when omMissing && floor(now / 60) % 2 == 0 { refresh() }
+  let later = daily == null ? [] : range(len(daily.time)).map(i => {
+    date: daily.time[i],
+    code: get(wmo, str(daily.weather_code[i]), "116"),
+    rain: num(daily.precipitation_probability_max[i], 0),
+    lo: round(daily.temperature_2m_min[i], 0),
+    hi: round(daily.temperature_2m_max[i], 0)
+  })
+  let forecast = ((wx.weather ?? []).map(d => {
+    date: d.date,
+    code: d.hourly[4].weatherCode,
+    rain: max(d.hourly.map(h => num(h.chanceofrain))),
+    lo: num(get(d, "mintemp" + unit)),
+    hi: num(get(d, "maxtemp" + unit))
+  }) + drop(later, len(wx.weather ?? [])))
+  // The listed days' range, so their bars share one scale.
+  let lowest = min(forecast.map(d => d.lo))
+  let highest = max(forecast.map(d => d.hi))
+  let uv = num(cur.uvIndex)
+
+  // The tile: one dot-matrix panel with the phone tile's cell size. A split-flap board shows the date
+  // (it clatters into place each time the page comes into view), and the weather plays as a little
+  // pixel scene beside the temperature. Layout in cells: 175 x 47.
+  let cell = min(((tileWidth ?? 364) - 24) / 175, ((tileHeight ?? 117) - 24) / 47)
+  let flipSet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+  let blankGlyph = ["...", "...", "...", "...", "..."]
+  // wttr's weather codes, by what the scene should show.
+  let code = cur.weatherCode ?? "116"
+  let kind = code == "113" ? "clear" : code == "116" ? "partly" : contains(["119", "122"], code) ? "cloudy" : contains(["143", "248", "260"], code) ? "fog" : contains(["200", "386", "389", "392", "395"], code) ? "storm" : contains(["179", "182", "185", "227", "230", "317", "320", "323", "326", "329", "332", "335", "338", "350", "362", "365", "368", "371", "374", "377"], code) ? "snow" : "rain"
+  let tNow = get(cur, "temp_" + unit)
+  let tC = imperial ? (num(tNow) - 32) * 5 / 9 : num(tNow)
+  let tColor = tC < 5 ? blue : tC < 16 ? cyan : tC < 24 ? green : tC < 30 ? yellow : tC < 35 ? orange : red
+  let tStr = cur == null ? "--°" : "${tNow}°"
+  let tk = len(tStr) > 3 ? 2 : 3
+  let board = [
+    {t: upper(fmtTime(now, "EEE")), x: 0, y: 0, c: accent, g: 0},
+    {t: fmtTime(now, "dd"), x: 48, y: 0, c: foreground, g: 3},
+    {t: upper(fmtTime(now, "MMM")), x: 0, y: 17, c: foreground, g: 5},
+    {t: fmtTime(now, "yyyy"), x: 30, y: 17, c: mix(foreground, background, 0.25), g: 8}
+  ]
+  // Text that may not fit its 46 cells scrolls like a marquee.
+  let ticker = [
+    {t: cur == null ? (wx == null ? "WEATHER..." : "OFFLINE") : upper(trim(cur.weatherDesc[0].value)), y: 5, c: foreground},
+    {t: upper(town ?? ""), y: 40, c: muted}
+  ]
+  let starX = [3, 9, 31, 40, 44, 14, 36]
+  let starY = [3, 12, 2, 9, 20, 24, 27]
+  let snowX = [2, 15, 7, 19, 11, 4, 17, 9, 21, 13]
+
+  // The sky: where the sun and moon really are, from the clock and your coordinates (a low-precision
+  // almanac, good to a degree or so: it gives wttr's rise and set times to the minute), and the moon's
+  // phase. It moves on its own, recomputed with the clock while the page is on screen.
+  let lat = num(coords[0], 999)
+  let lon = num(coords[1], 999)
+  let haveSky = lat < 900 && lon < 900 && now != null
+  let jd = now / 86400 - 10957.5
+  let eps = rad(23.439)
+  let gmst = (280.46061837 + 360.98564736629 * jd) % 360
+  let sg = rad(357.529 + 0.98560028 * jd)
+  let mM = rad(134.963 + 13.064993 * jd)
+  let mD = rad(297.850 + 12.190749 * jd)
+  let sunLon = 280.459 + 0.98564736 * jd + 1.915 * sin(sg) + 0.020 * sin(2 * sg)
+  let moonLon = 218.316 + 13.176396 * jd + 6.289 * sin(mM) + 1.274 * sin(2 * mD - mM) + 0.658 * sin(2 * mD) - 0.186 * sin(sg) - 0.059 * sin(2 * mD - 2 * mM) - 0.057 * sin(2 * mD - mM - sg)
+  let moonLat = 5.128 * sin(rad(93.272 + 13.229350 * jd))
+  // Ecliptic to equatorial to the local sky: altitude, and azimuth from north, clockwise (degrees).
+  let bodies = [[sunLon, 0], [moonLon, moonLat]]
+    .map(b => {lr: rad(b[0]), br: rad(b[1])})
+    .map(b => {ra: deg(atan2(sin(b.lr) * cos(eps) - sin(b.br) / cos(b.br) * sin(eps), cos(b.lr))), sd: sin(b.br) * cos(eps) + cos(b.br) * sin(eps) * sin(b.lr)})
+    .map(b => {ra: b.ra, dec: atan2(b.sd, sqrt(max(0, 1 - b.sd * b.sd))), h: rad(gmst + lon - b.ra)})
+    .map(b => {ra: b.ra, dec: b.dec, h: b.h, sa: sin(rad(lat)) * sin(b.dec) + cos(rad(lat)) * cos(b.dec) * cos(b.h)})
+    .map(b => {ra: b.ra, dec: b.dec, alt: deg(atan2(b.sa, sqrt(max(0, 1 - b.sa * b.sa)))), az: (deg(atan2(-cos(b.dec) * sin(b.h), sin(b.dec) * cos(rad(lat)) - cos(b.dec) * cos(b.h) * sin(rad(lat)))) + 360) % 360})
+  // In the scene, facing the equator: east on the left, west on the right; higher in the sky, higher up.
+  let skyPos = bodies.map(b => {x: clamp(24 + (((lat < 0 ? b.az + 180 : b.az) % 360) - 180) / 110 * 22, -8, 56), y: 36 - round(sin(rad(max(b.alt, -20))) * 29)})
+  let sunAlt = haveSky ? bodies[0].alt : (night ? -20 : 40)
+  let moonAlt = haveSky ? bodies[1].alt : (night ? 40 : -90)
+  let sunXY = haveSky ? skyPos[0] : {x: 24, y: 17}
+  let moonXY = haveSky ? skyPos[1] : {x: 24, y: 17}
+  // Night in the sky scenes: the sun is drawn down to 4 degrees under the horizon, the moon only past that, so the
+  // two never share the sky.
+  let dark = sunAlt < -4
+  // The moon's phase from its angle to the sun (0 new, 180 full), lit on the sun's side: the right while
+  // waxing (north of the equator). Drawn cell by cell on a 13-cell disc; d is the earthshine-dim rest.
+  let elong = ((moonLon - sunLon) % 360 + 360) % 360
+  let moonLit = round((1 - cos(rad(elong))) / 2 * 100)
+  let ct = cos(rad(elong))
+  let sgn = (elong < 180 ? 1 : -1) * (lat < 0 ? -1 : 1)
+  let moonNow = range(13).map(j => join(range(13).map(i => (i - 6) * (i - 6) + (j - 6) * (j - 6) > 42.25 ? "." : sgn * (i - 6) > sqrt(max(0, 42.25 - (j - 6) * (j - 6))) * ct ? "l" : "d"), ""))
+  // Sunrise and sunset from the same almanac, as Unix times. wttr's own are in its idea of the local
+  // time, which can be an hour off the phone's; the gap between the two sunrises puts wttr's hours on the phone's clock.
+  let L0 = (280.459 + 0.98564736 * jd) % 360
+  let eotMin = ((((L0 - bodies[0].ra) % 360) + 540) % 360 - 180) * 4
+  let noonMin = 720 - 4 * lon - eotMin
+  let cosH0 = (sin(rad(-0.833)) - sin(rad(lat)) * sin(bodies[0].dec)) / (cos(rad(lat)) * cos(bodies[0].dec))
+  let h0 = abs(cosH0) <= 1 ? deg(atan2(sqrt(1 - cosH0 * cosH0), cosH0)) : null
+  let dayStart = now - now % 86400
+  let riseTs = haveSky && h0 != null ? dayStart + round((noonMin - 4 * h0) * 60) : null
+  let setTs = haveSky && h0 != null ? dayStart + round((noonMin + 4 * h0) * 60) : null
+  let riseH = riseTs == null ? 6 : num(fmtTime(riseTs, "H")) + num(fmtTime(riseTs, "m")) / 60
+  let setH = setTs == null ? 18 : num(fmtTime(setTs, "H")) + num(fmtTime(setTs, "m")) / 60
+  let wttrRise = match(day.astronomy[0].sunrise ?? "", "(\\d+):(\\d+) (AM|PM)")
+  let wttrRiseH = wttrRise == null ? null : num(wttrRise[0]) % 12 + (wttrRise[2] == "PM" ? 12 : 0) + num(wttrRise[1]) / 60
+  let offH = wttrRiseH == null || riseTs == null ? 0 : round(wttrRiseH - riseH)
+  // The next 24 hours in wttr's 3-hour steps, from today's and tomorrow's forecasts, on the phone's clock.
+  let steps = flatten(range(2).map(i => (wx.weather[i].hourly ?? []).map(h => {
+    hr: i * 24 + num(h.time) / 100 - offH,
+    t: num(get(h, "temp" + unit)),
+    rain: num(h.chanceofrain),
+    code: h.weatherCode
+  }))).filter(s => s.hr > hourNow - 3).take(8)
+  let tLo = min(steps.map(s => s.t))
+  let tHi = max(steps.map(s => s.t))
+  // wttr's codes by what to draw, for the screen's small icons (7x7: y sun, m moon, w cloud, c rain).
+  let kindOf = {
+    "113": "clear", "116": "partly", "119": "cloudy", "122": "cloudy", "143": "fog", "248": "fog", "260": "fog",
+    "200": "storm", "386": "storm", "389": "storm", "392": "storm", "395": "storm",
+    "179": "snow", "182": "snow", "185": "snow", "227": "snow", "230": "snow", "317": "snow", "320": "snow",
+    "323": "snow", "326": "snow", "329": "snow", "332": "snow", "335": "snow", "338": "snow", "350": "snow",
+    "362": "snow", "365": "snow", "368": "snow", "371": "snow", "374": "snow", "377": "snow"
+  }
+  let icons = {
+    clear: ["y..y..y", ".yyyyy.", ".yyyyy.", "yyyyyyy", ".yyyyy.", ".yyyyy.", "y..y..y"],
+    clearN: ["..mmm..", ".mm....", "mm.....", "mm.....", "mm.....", ".mm....", "..mmm.."],
+    partly: ["...y.y.", "....yyy", "..wwyyy", ".wwwwwy", "wwwwwww", "wwwwwww", "......."],
+    partlyN: ["....mm.", "...mm..", "..wwm..", ".wwwwwm", "wwwwwww", "wwwwwww", "......."],
+    cloudy: [".......", "..www..", ".wwwww.", "wwwwwww", "wwwwwww", ".......", "......."],
+    rain: ["..www..", ".wwwww.", "wwwwwww", ".......", ".c.c.c.", "c.c.c..", "......."],
+    storm: ["..www..", ".wwwww.", "wwwwwww", "...y...", "..yy...", "...y...", "..y...."],
+    snow: ["..www..", ".wwwww.", "wwwwwww", ".......", ".w.w.w.", "..w.w..", ".w.w.w."],
+    fog: [".......", "wwwww..", ".......", "..wwwww", ".......", "wwwww..", "......."]
+  }
+  let iconPal = {y: yellow, m: mix(yellow, foreground, 0.55), w: alpha(foreground, 0.85), c: cyan}
+  // The moon, in words: its phase and when it's next full.
+  let phaseName = elong < 11.25 || elong >= 348.75 ? "NEW MOON" : elong < 78.75 ? "WAXING CRESCENT" : elong < 101.25 ? "FIRST QUARTER" : elong < 168.75 ? "WAXING GIBBOUS" : elong < 191.25 ? "FULL MOON" : elong < 258.75 ? "WANING GIBBOUS" : elong < 281.25 ? "LAST QUARTER" : "WANING CRESCENT"
+  // The next full moon: the moon's speed varies, so look ahead in 3-hour steps for elongation passing 180.
+  let fullTs = (range(1, 241).map(k => now + k * 10800)
+    .map(t => {t: t, d: t / 86400 - 10957.5})
+    .map(o => {t: o.t, d: o.d, g: rad(357.529 + 0.98560028 * o.d), mm: rad(134.963 + 13.064993 * o.d), md: rad(297.850 + 12.190749 * o.d)})
+    .map(o => {t: o.t, e: (((218.316 + 13.176396 * o.d + 6.289 * sin(o.mm) + 1.274 * sin(2 * o.md - o.mm) + 0.658 * sin(2 * o.md) - 0.186 * sin(o.g) - 0.059 * sin(2 * o.md - 2 * o.mm) - 0.057 * sin(2 * o.md - o.mm - o.g)) - (280.459 + 0.98564736 * o.d + 1.915 * sin(o.g) + 0.020 * sin(2 * o.g))) % 360 + 360) % 360})
+    .find(o => o.e >= 180 && o.e < 182.5)).t
+  // The screen's text rows: 160 cells across, so 40 characters at the small size.
+  let wxDesc = cur == null ? (wx == null ? "WEATHER..." : "OFFLINE") : upper(trim(cur.weatherDesc[0].value))
+  let viaText = place != "" ? "PINNED PLACE" : "BY NETWORK, ROUGHLY"
+  // The conditions, from Open-Meteo's current hour (so a tile matches its hourly chart), or wttr's while it loads.
+  let hn = hourly == null ? null : hourly[0]
+  let next24 = hourly == null ? [] : hourly.take(24)
+  let lastOffs = hourly == null ? 0 : max(len(hourly) - 12, 0)
+  let dirs16 = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+  let wsUnit = imperial ? "MPH" : "KM/H"
+  let uvNow = hn == null ? uv : hn.uv
+  let uvR = round(uvNow)
+  let pTrend = hourly == null || len(hourly) < 4 ? 0 : hourly[3].p - hourly[0].p
+  let rain24 = max(next24.map(h => h.pop))
+  let mm24 = sum(next24.map(h => h.mm))
+  let uvHigh = next24.filter(h => h.uv >= 3)
+  let wetHour = next24.sortBy(h => -h.pop)[0]
+  let minVis = min(next24.map(h => h.vis))
+  let wxCond = cur == null && hn == null ? [] : [
+    {m: "wind", l: "WIND ${hn == null ? upper(cur.winddir16Point ?? "") : dirs16[round(hn.wd / 22.5) % 16]}", v: hn == null ? (imperial ? "${cur.windspeedMiles} MPH" : "${cur.windspeedKmph} KM/H") : "${hn.ws} ${wsUnit}", c: cyan},
+    {m: "humidity", l: "HUMIDITY", v: "${hn == null ? cur.humidity : hn.rh}%", c: blue},
+    {m: "rain", l: hn == null ? "RAIN · ${imperial ? cur.precipInches + " IN" : cur.precipMM + " MM"}" : "RAIN 24H · ${fixed(mm24, 1)} ${imperial ? "IN" : "MM"}", v: "${hn == null ? max(day.hourly.map(h => num(h.chanceofrain))) : rain24}%", c: blue},
+    {m: "uv", l: "UV · ${uvR >= 11 ? "EXTREME" : uvR >= 8 ? "VERY HIGH" : uvR >= 6 ? "HIGH" : uvR >= 3 ? "MODERATE" : "LOW"}", v: "${uvR}", c: uvR >= 8 ? red : uvR >= 6 ? orange : uvR >= 3 ? yellow : green},
+    {m: "pressure", l: "PRESSURE${pTrend > 0.5 ? " ↑" : pTrend < -0.5 ? " ↓" : ""}", v: hn == null ? (imperial ? "${cur.pressureInches} INHG" : "${cur.pressure} HPA") : imperial ? "${fixed(hn.p * 0.02953, 2)} INHG" : "${round(hn.p)} HPA", c: foreground},
+    {m: "visibility", l: "VISIBILITY", v: hn == null ? (imperial ? "${cur.visibilityMiles} MI" : "${cur.visibility} KM") : imperial ? "${round(hn.vis / 1609)} MI" : "${round(hn.vis / 1000)} KM", c: foreground}
+  ]
+  // What an opened tile shows: a title and a one-line summary over the hourly chart.
+  let detailInfo = {
+    wind: {t: "WIND", s: hourly == null ? "" : "GUSTS UP TO ${max(next24.map(h => h.wg))} ${wsUnit}"},
+    humidity: {t: "HUMIDITY %", s: hn == null ? "" : "DEW POINT ${hn.dp}° · ${hn.dp >= 20 ? "MUGGY" : hn.dp >= 16 ? "HUMID" : hn.dp >= 10 ? "COMFORTABLE" : "DRY"}"},
+    rain: {t: "CHANCE OF RAIN %", s: rain24 < 10 ? "NO RAIN EXPECTED" : "MOST LIKELY ${fmtTime(wetHour.t, "HH")}:00 · ${wetHour.pop}%"},
+    uv: {t: "UV INDEX", s: len(uvHigh) == 0 ? "LOW ALL DAY" : "PROTECT ${fmtTime(first(uvHigh).t, "HH")}-${fmtTime(last(uvHigh).t + 3600, "HH")}H"},
+    pressure: {t: "PRESSURE ${imperial ? "INHG" : "HPA"}", s: "${pTrend > 0.5 ? "RISING" : pTrend < -0.5 ? "FALLING" : "STEADY"} ${pTrend >= 0 ? "+" : ""}${fixed(pTrend, 1)} HPA IN 3H"},
+    visibility: {t: "VISIBILITY ${imperial ? "MI" : "KM"}", s: minVis < 1000 ? "FOG AT TIMES" : minVis < 5000 ? "MIST AT TIMES" : "CLEAR AIR"}
+  }
+  // Wind arrows, pointing the way the wind blows: N, NE, E, SE, S, SW, W, NW.
+  let arrows = [
+    ["...a...", "..aaa..", ".a.a.a.", "...a...", "...a...", "...a...", "...a..."],
+    ["...aaaa", ".....aa", "....a.a", "...a..a", "..a....", ".a.....", "a......"],
+    [".......", "....a..", ".....a.", "aaaaaaa", ".....a.", "....a..", "......."],
+    ["a......", ".a.....", "..a....", "...a..a", "....a.a", ".....aa", "...aaaa"],
+    ["...a...", "...a...", "...a...", "...a...", ".a.a.a.", "..aaa..", "...a..."],
+    ["......a", ".....a.", "....a..", "a..a...", "a.a....", "aa.....", "aaaa..."],
+    [".......", "..a....", ".a.....", "aaaaaaa", ".a.....", "..a....", "......."],
+    ["aaaa...", "aa.....", "a.a....", "a..a...", "....a..", ".....a.", "......a"]
+  ]
+  let windDX = [0, 1, 1, 1, 0, -1, -1, -1]
+  let windDY = [-1, -1, 0, 1, 1, 1, 0, -1]
+  // The sun & moon section: golden hour (the sun 6 degrees up) from the same almanac, which of dawn or dusk to
+  // paint (before or after solar noon), and what Pierrot is up to for the moon's phase.
+  let cosHg = (sin(rad(6)) - sin(rad(lat)) * sin(bodies[0].dec)) / (cos(rad(lat)) * cos(bodies[0].dec))
+  let hg = abs(cosHg) <= 1 ? deg(atan2(sqrt(1 - cosHg * cosHg), cosHg)) : null
+  let goldenEveTs = haveSky && hg != null ? dayStart + round((noonMin + 4 * hg) * 60) : null
+  let goldenMornTs = haveSky && hg != null ? dayStart + round((noonMin - 4 * hg) * 60) : null
+  let isDawn = (now % 86400) / 60 < noonMin
+  let pose = elong < 22.5 || elong >= 337.5 ? "seek" : elong < 67.5 ? "sit" : elong < 157.5 ? "play" : elong < 202.5 ? "serenade" : elong < 292.5 ? "doze" : "sleep"
+  // The sun scene's palm and birds.
+  let scenery = {
+    palm: ["...pp..pp.....", ".pppppppppp...", "pp..ppppp.ppp.", "p..pp.pp.pp..p", "...p..pp..p...", "......pp......", ".......p......", ".......p......", ".......pp.....", "........p.....", "........p.....", "........p.....", "........pp....", "........pp....", ".......pppp..."],
+    bird: ["p.p", ".p."],
+    bird2: ["...", "ppp"],
+    note: ["..pp", "..p.", "ppp.", "pp.."],
+    lanternGlow: [".lll.", "lllll", "lllll", ".lll."]
+  }
+  // Pierrot (o outline, w costume, s fold shade, k cap/buttons/slippers, h the cap's shine, r lips, t tear, c blush,
+  // f face shade): hand-drawn head, smock and ruff; limbs drawn as jointed sleeves and trouser legs.
+  let pq = {o: mix(background, rgb(0, 0, 0, 1), 0.45), w: mix(foreground, rgb(255, 255, 255, 1), 0.55), s: mix(foreground, background, 0.28), k: mix(background, rgb(0, 0, 0, 1), 0.4), h: mix(background, foreground, 0.38), r: red, t: cyan, c: mix(red, rgb(255, 255, 255, 1), 0.35), f: mix(foreground, rgb(255, 255, 255, 1), 0.25)}
+  // The dawn hills (f far, n near), rows 23-45 of the sun scene, worked out once instead of per column per frame.
+  let hillRows = range(23).map(r => join(range(160).map(x => r + 23 >= 35 - round(1 + 2.5 * sin(x * 0.09 + 1)) ? "n" : r + 23 >= 30 - round(4 + 2 * sin(x * 0.15) + sin(x * 0.37)) ? "f" : "."), ""))
+  let pHead = ["....ooooo....", "..ookhhkkoo..", ".okkhkkkkkko.", ".okhkkkkkkko.", "okkkkkkkkkkko", "okkwwwwwwwkko", "owwwwwwwwwwwo", "owwwwwwwwwwwo", "owwwwwwwwwwfo", "owwwwwwwwwwfo", ".owwwwwwwwfo.", "..owwwwwwfo..", "...ooooooo..."]
+  let pEyes = {
+    open: ["..s...s..", ".s.....s.", "..k...k..", "..k...k.."],
+    shut: ["..s...s..", ".s.....s.", ".........", ".kk...kk."],
+    left: ["..s...s..", ".s.....s.", ".k...k...", ".k...k..."],
+    right: ["..s...s..", ".s.....s.", "...k...k.", "...k...k."],
+    down: ["..s...s..", ".s.....s.", ".........", "..k...k.."],
+    up: [".ss...ss.", "..k...k..", "..k...k..", "........."],
+    wide: [".s.....s.", "..s...s..", ".kk...kk.", ".kk...kk."],
+    happy: ["..s...s..", ".........", "..k...k..", ".k.k.k.k."],
+    droop: ["..s...s..", ".s.....s.", ".kk...kk.", "..k...k.."]
+  }
+  let pMouth = {
+    pout: [".r.", "..."],
+    smile: ["r.r", ".r."],
+    o: ["rrr", "rkr"],
+    sing: ["rkr", ".r."],
+    yawn: ["rkr", "rkr"],
+    flat: ["rrr", "..."]
+  }
+  let pRuff = [".oo.ooo.ooo.ooo.", "owwswwswwswwswwo", "oswwswwswwswwswo", ".oooooooooooooo."]
+  let pTorso = ["....owwwwwwwo....", "...owwwwwwwwwo...", "...owswwkkwwswo..", "..owwswwkkwwswwo.", "..owwswwwwwwswwo.", "..owswwwkkwwwswo.", ".owwswwwkkwwwswwo", ".owwswwwwwwwwswwo", ".owswwwwkkwwwwswo", "owwswwwwkkwwwwsww", "owswwwwwwwwwwwswo", "owwwwwwwwwwwwwwwo", ".ooooooooooooooo."]
+  let starSmall = [".y.", "yyy", ".y."]
+  let starBig = ["..y..", ".yyy.", "yyyyy", ".y.y."]
+  // The stage: Paris rooftops (b facade, e zinc, c chimneys), its windows [x, y, kind] and a hazy Eiffel Tower.
+  let roofRows = ["...................................................c.c......................c.c.......................c.c............c.c........................................", ".................c.c...............................cccc.....................cccc......................cccc...........cccc.......................c.c.............", ".................cccc..............................cccc.....................cccc......................cccc...........cccc.......................cccc............", "..c.c............cccc..............e............e..cccc......e............e.cccc.......e..............cccc.....e.....cccc.....c.c...............cccc............", "..cccc...........cccc.....e.....eebbbeeeeeeeeeebbbeeeeeeeeeebbbeeeeeeeeeebbbeeeeeeeeeebbbeeeeeeeee....eebbbeeebbbeeebbbeee....cccc..............cccc.....e......", "..cccc...........eebbbeeebbb...eeebbbeeeeeeeeeebbbeeeeeeeeeebbbeeeeeeeeeebbbeeeeeeeeeebbbeeeeeeeeee..eeebbbeeebbbeeebbbeeee...cccc..............eebbbeeebbbeee..", "..cccc.....e....eeebbbeeebbbe.eeeebbbeeeeeeeeeebbbeeeeeeeeeebbbeeeeeeeeeebbbeeeeeeeeeebbbeeeeeeeeeeeeeeebbbeeebbbeeebbbeeeee..cccc.....e.......eeebbbeeebbbeeee.", "..eebbbeeebbb..eeeebbbeeebbbeebbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb..eebbbeeebbbeee..eeeebbbeeebbbeeeee", ".eeebbbeeebbbe.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.eeebbbeeebbbeeee.bbbbbbbbbbbbbbbbbb", "eeeebbbeeebbbeebbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbeeeebbbeeebbbeeeeebbbbbbbbbbbbbbbbbb", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+  let roofWins = [[5, 8, 1], [11, 8, 7], [3, 12, 6], [7, 12, 8], [11, 12, 1], [20, 6, 8], [26, 6, 5], [18, 10, 4], [22, 10, 6], [26, 10, 8], [35, 5, 6], [48, 5, 7], [61, 5, 8], [74, 5, 0], [87, 5, 1], [33, 9, 5], [33, 14, 2], [37, 9, 7], [37, 14, 4], [41, 9, 0], [41, 14, 6], [45, 9, 2], [45, 14, 8], [49, 9, 4], [49, 14, 1], [53, 9, 6], [53, 14, 3], [57, 9, 8], [57, 14, 5], [61, 9, 1], [61, 14, 7], [65, 9, 3], [65, 14, 0], [69, 9, 5], [69, 14, 2], [73, 9, 7], [73, 14, 4], [77, 9, 0], [77, 14, 6], [81, 9, 2], [81, 14, 8], [85, 9, 4], [85, 14, 1], [89, 9, 6], [89, 14, 3], [93, 9, 8], [93, 14, 5], [97, 9, 1], [97, 14, 7], [105, 5, 2], [111, 5, 8], [117, 5, 5], [103, 9, 5], [103, 14, 2], [107, 9, 7], [107, 14, 4], [111, 9, 0], [111, 14, 6], [115, 9, 2], [115, 14, 8], [119, 9, 4], [119, 14, 1], [129, 8, 0], [135, 8, 6], [127, 12, 0], [131, 12, 2], [135, 12, 4], [139, 12, 6], [147, 6, 1], [153, 6, 7], [145, 10, 4], [149, 10, 6], [153, 10, 8], [157, 10, 1]]
+  let tower = [".....h.....", ".....h.....", ".....h.....", "....hhh....", "....hhh....", "....h.h....", "...hhhhh...", "...h...h...", "...h...h...", "...h...h...", "..hh...hh..", "..hhhhhhh..", "..h.....h..", ".hh.....hh.", ".h..hhh..h.", ".h.h...h.h.", "hh.......hh", "h.........h"]
+  let stageStars = [[6, 5], [19, 14], [31, 4], [44, 20], [58, 8], [70, 17], [83, 3], [97, 12], [141, 6], [152, 18], [11, 30], [67, 33], [149, 33], [38, 38], [89, 26]]
+  // The moon at one cell per pixel (39x39): l lit, m maria, d the earthshine side. Redrawn as the phase moves a degree.
+  let elongR = round(elong)
+  let ctR = cos(rad(elongR))
+  let sgnR = (elongR < 180 ? 1 : -1) * (lat < 0 ? -1 : 1)
+  let mares = [[13, 13, 5], [23, 10, 4], [26, 20, 5], [15, 25, 6], [27, 29, 3]]
+  let moonBig = range(39).map(j => join(range(39).map(i => (i - 19) * (i - 19) + (j - 19) * (j - 19) > 380.25 ? "." : sgnR * (i - 19) > sqrt(max(0, 380.25 - (j - 19) * (j - 19))) * ctR ? (mares.any(m => (i - m[0]) * (i - m[0]) + (j - m[1]) * (j - m[1]) <= m[2] * m[2]) ? "m" : "l") : "d"), ""))
+  // Fishing for stars from the crescent (10 s): his line hangs in a lit dormer window down in the city; its light
+  // bites, he reels it up as a star, admires it, tosses it into the sky, and casts again while someone switches
+  // the window back on. Eased between keyframes; legs swing and the reel cranks on top.
+  let fishKeys = [
+    {uaL: -40, faL: -120, uaR: 20, faR: -60, thL: -82, shL: -8, thR: 82, shR: 8, hdx: 0, hdy: 0, rod: -135, eyes: "down", mouth: "pout", t: 0.0},
+    {uaL: -40, faL: -120, uaR: 20, faR: -60, thL: -82, shL: -8, thR: 82, shR: 8, hdx: -1, hdy: 0, rod: -135, eyes: "down", mouth: "pout", t: 2.6},
+    {uaL: -30, faL: -120, uaR: 20, faR: -60, thL: -82, shL: -8, thR: 82, shR: 8, hdx: -1, hdy: 0, rod: -125, eyes: "wide", mouth: "o", t: 3.0},
+    {uaL: -55, faL: -140, uaR: 20, faR: -60, thL: -82, shL: -8, thR: 82, shR: 8, hdx: 0, hdy: 0, rod: -145, eyes: "wide", mouth: "o", t: 3.5},
+    {uaL: -60, faL: -145, uaR: 20, faR: -60, thL: -82, shL: -8, thR: 82, shR: 8, hdx: 0, hdy: 0, rod: -150, eyes: "right", mouth: "pout", t: 5.4},
+    {uaL: -60, faL: -145, uaR: 40, faR: -30, thL: -82, shL: -8, thR: 82, shR: 8, hdx: 0, hdy: 0, rod: -150, eyes: "happy", mouth: "smile", t: 5.8},
+    {uaL: -60, faL: -145, uaR: 60, faR: 20, thL: -82, shL: -8, thR: 82, shR: 8, hdx: 0, hdy: 0, rod: -150, eyes: "happy", mouth: "smile", t: 6.9},
+    {uaL: -40, faL: -120, uaR: 20, faR: -20, thL: -82, shL: -8, thR: 82, shR: 8, hdx: 0, hdy: 0, rod: -150, eyes: "happy", mouth: "smile", t: 7.2},
+    {uaL: -40, faL: -120, uaR: 150, faR: 170, thL: -82, shL: -8, thR: 82, shR: 8, hdx: 0, hdy: 0, rod: -140, eyes: "up", mouth: "o", t: 7.6},
+    {uaL: -40, faL: -120, uaR: 60, faR: 30, thL: -82, shL: -8, thR: 82, shR: 8, hdx: 0, hdy: 0, rod: -130, eyes: "up", mouth: "smile", t: 8.4},
+    {uaL: -40, faL: -120, uaR: 20, faR: -60, thL: -82, shL: -8, thR: 82, shR: 8, hdx: 0, hdy: 0, rod: -135, eyes: "down", mouth: "pout", t: 10.0}
+  ]
+  // Pacing the roof with a lantern at new moon (16 s): stops, lifts the lantern to the sky, scratches his head,
+  // shrugs at us, and walks back.
+  let seekKeys = [
+    {uaL: -22, faL: -8, uaR: 115, faR: 150, thL: -6, shL: 0, thR: 6, shR: 0, hx: 42, hy: 0, hdx: 0, hdy: 0, walk: 1, eyes: "right", mouth: "pout", t: 0.0},
+    {uaL: -22, faL: -8, uaR: 115, faR: 150, thL: -6, shL: 0, thR: 6, shR: 0, hx: 86, hy: 0, hdx: 0, hdy: 0, walk: 1, eyes: "right", mouth: "pout", t: 5.0},
+    {uaL: -22, faL: -8, uaR: 150, faR: 172, thL: -6, shL: 0, thR: 6, shR: 0, hx: 88, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "up", mouth: "o", t: 5.5},
+    {uaL: -22, faL: -8, uaR: 150, faR: 172, thL: -6, shL: 0, thR: 6, shR: 0, hx: 88, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "up", mouth: "o", t: 6.6},
+    {uaL: -150, faL: 120, uaR: 115, faR: 150, thL: -6, shL: 0, thR: 6, shR: 0, hx: 88, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "left", mouth: "flat", t: 7.2},
+    {uaL: -150, faL: 120, uaR: 115, faR: 150, thL: -6, shL: 0, thR: 6, shR: 0, hx: 88, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "right", mouth: "flat", t: 8.2},
+    {uaL: -75, faL: -120, uaR: 120, faR: 140, thL: -6, shL: 0, thR: 6, shR: 0, hx: 88, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "open", mouth: "flat", t: 8.8},
+    {uaL: -75, faL: -120, uaR: 120, faR: 140, thL: -6, shL: 0, thR: 6, shR: 0, hx: 88, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "open", mouth: "flat", t: 9.6},
+    {uaL: -22, faL: -8, uaR: 115, faR: 150, thL: -6, shL: 0, thR: 6, shR: 0, hx: 86, hy: 0, hdx: 0, hdy: 0, walk: 1, eyes: "left", mouth: "pout", t: 10.0},
+    {uaL: -22, faL: -8, uaR: 115, faR: 150, thL: -6, shL: 0, thR: 6, shR: 0, hx: 44, hy: 0, hdx: 0, hdy: 0, walk: 1, eyes: "left", mouth: "pout", t: 15.0},
+    {uaL: -22, faL: -8, uaR: 150, faR: 172, thL: -6, shL: 0, thR: 6, shR: 0, hx: 42, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "up", mouth: "pout", t: 15.4},
+    {uaL: -22, faL: -8, uaR: 115, faR: 150, thL: -6, shL: 0, thR: 6, shR: 0, hx: 42, hy: 0, hdx: 0, hdy: 0, walk: 1, eyes: "right", mouth: "pout", t: 16.0}
+  ]
+  // On a chimney with a mandolin (10 s): strumming, foot tapping, head bobbing, a flourish at the end.
+  let playKeys = [
+    {uaL: -20, faL: -75, uaR: 25, faR: -65, thL: -82, shL: -10, thR: 82, shR: 10, hx: 0, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "shut", mouth: "sing", strum: 1, t: 0.0},
+    {uaL: -20, faL: -75, uaR: 25, faR: -65, thL: -82, shL: -10, thR: 82, shR: 10, hx: 0, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "open", mouth: "smile", strum: 1, t: 3.0},
+    {uaL: -20, faL: -75, uaR: 25, faR: -65, thL: -82, shL: -10, thR: 82, shR: 10, hx: 0, hy: 0, hdx: 1, hdy: 0, walk: 0, eyes: "shut", mouth: "sing", strum: 1, t: 5.0},
+    {uaL: -20, faL: -75, uaR: 25, faR: -65, thL: -82, shL: -10, thR: 82, shR: 10, hx: 0, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "shut", mouth: "sing", strum: 1, t: 6.8},
+    {uaL: -20, faL: -75, uaR: 120, faR: 165, thL: -82, shL: -10, thR: 82, shR: 10, hx: 0, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "happy", mouth: "o", strum: 0, t: 7.2},
+    {uaL: -20, faL: -75, uaR: 10, faR: -40, thL: -82, shL: -10, thR: 82, shR: 10, hx: 0, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "happy", mouth: "sing", strum: 0, t: 7.7},
+    {uaL: -20, faL: -75, uaR: 25, faR: -65, thL: -82, shL: -10, thR: 82, shR: 10, hx: 0, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "happy", mouth: "smile", strum: 1, t: 8.4},
+    {uaL: -20, faL: -75, uaR: 25, faR: -65, thL: -82, shL: -10, thR: 82, shR: 10, hx: 0, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "shut", mouth: "sing", strum: 1, t: 10.0}
+  ]
+  // A serenade for the full moon (12 s): arms open, hand on heart, kneeling, a hop, a kiss blown, a bow.
+  let serKeys = [
+    {uaL: -105, faL: -125, uaR: 110, faR: 140, thL: -6, shL: 0, thR: 6, shR: 0, hx: 0, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "up", mouth: "sing", t: 0.0},
+    {uaL: -110, faL: -135, uaR: 115, faR: 150, thL: -6, shL: 0, thR: 6, shR: 0, hx: 0, hy: 0, hdx: 1, hdy: 0, walk: 0, eyes: "up", mouth: "sing", t: 1.8},
+    {uaL: -20, faL: -10, uaR: 25, faR: -105, thL: -6, shL: 0, thR: 6, shR: 0, hx: 0, hy: 0, hdx: 1, hdy: 0, walk: 0, eyes: "shut", mouth: "pout", t: 2.4},
+    {uaL: -20, faL: -10, uaR: 25, faR: -105, thL: -6, shL: 0, thR: 6, shR: 0, hx: 0, hy: 0, hdx: 1, hdy: 0, walk: 0, eyes: "shut", mouth: "pout", t: 3.6},
+    {uaL: 60, faL: 95, uaR: 100, faR: 120, thL: -35, shL: -5, thR: 35, shR: 5, hx: 0, hy: 3, hdx: 0, hdy: 0, walk: 0, eyes: "up", mouth: "o", t: 4.2},
+    {uaL: 65, faL: 100, uaR: 105, faR: 125, thL: -35, shL: -5, thR: 35, shR: 5, hx: 0, hy: 3, hdx: 0, hdy: 0, walk: 0, eyes: "up", mouth: "o", t: 5.6},
+    {uaL: -22, faL: -8, uaR: 22, faR: 8, thL: -6, shL: 0, thR: 6, shR: 0, hx: 0, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "open", mouth: "pout", t: 6.3},
+    {uaL: -150, faL: -170, uaR: 115, faR: 150, thL: -6, shL: 0, thR: 6, shR: 0, hx: 0, hy: 1, hdx: 0, hdy: 0, walk: 0, eyes: "happy", mouth: "smile", t: 6.8},
+    {uaL: -165, faL: -178, uaR: 150, faR: 172, thL: -14, shL: 0, thR: 14, shR: 0, hx: 0, hy: -4, hdx: 0, hdy: 0, walk: 0, eyes: "happy", mouth: "smile", t: 7.15},
+    {uaL: -22, faL: -8, uaR: 22, faR: 8, thL: -6, shL: 0, thR: 6, shR: 0, hx: 0, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "happy", mouth: "smile", t: 7.5},
+    {uaL: -22, faL: -8, uaR: 25, faR: -150, thL: -6, shL: 0, thR: 6, shR: 0, hx: 0, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "shut", mouth: "o", t: 8.2},
+    {uaL: -22, faL: -8, uaR: 115, faR: 120, thL: -6, shL: 0, thR: 6, shR: 0, hx: 0, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "happy", mouth: "smile", t: 8.8},
+    {uaL: -22, faL: -8, uaR: 60, faR: 60, thL: -6, shL: 0, thR: 6, shR: 0, hx: 0, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "happy", mouth: "smile", t: 9.8},
+    {uaL: -40, faL: 20, uaR: 40, faR: -20, thL: -6, shL: 0, thR: 6, shR: 0, hx: 0, hy: 0, hdx: 0, hdy: 2, walk: 0, eyes: "shut", mouth: "smile", t: 10.3},
+    {uaL: -40, faL: 20, uaR: 40, faR: -20, thL: -6, shL: 0, thR: 6, shR: 0, hx: 0, hy: 0, hdx: 0, hdy: 2, walk: 0, eyes: "shut", mouth: "smile", t: 11.2},
+    {uaL: -105, faL: -125, uaR: 110, faR: 140, thL: -6, shL: 0, thR: 6, shR: 0, hx: 0, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "up", mouth: "sing", t: 12.0}
+  ]
+  // Dozing against the waning moon (12 s): nodding off, startled awake, looking round, a big yawn and stretch.
+  let dozeKeys = [
+    {uaL: -12, faL: 55, uaR: 12, faR: -55, thL: -82, shL: -6, thR: 82, shR: 6, hx: 0, hy: 0, hdx: 1, hdy: 1, walk: 0, eyes: "shut", mouth: "pout", t: 0.0},
+    {uaL: -12, faL: 55, uaR: 12, faR: -55, thL: -82, shL: -6, thR: 82, shR: 6, hx: 0, hy: 0, hdx: 1, hdy: 2, walk: 0, eyes: "shut", mouth: "pout", t: 4.4},
+    {uaL: -12, faL: 55, uaR: 12, faR: -55, thL: -82, shL: -6, thR: 82, shR: 6, hx: 0, hy: 0, hdx: 1, hdy: 3, walk: 0, eyes: "shut", mouth: "pout", t: 5.0},
+    {uaL: -70, faL: -110, uaR: 70, faR: 110, thL: -82, shL: -6, thR: 82, shR: 6, hx: 0, hy: 0, hdx: 0, hdy: -1, walk: 0, eyes: "wide", mouth: "o", t: 5.25},
+    {uaL: -12, faL: 55, uaR: 12, faR: -55, thL: -82, shL: -6, thR: 82, shR: 6, hx: 0, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "left", mouth: "pout", t: 5.9},
+    {uaL: -12, faL: 55, uaR: 12, faR: -55, thL: -82, shL: -6, thR: 82, shR: 6, hx: 0, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "right", mouth: "pout", t: 6.7},
+    {uaL: -165, faL: -178, uaR: 150, faR: 172, thL: -82, shL: -6, thR: 82, shR: 6, hx: 0, hy: 0, hdx: 0, hdy: -1, walk: 0, eyes: "shut", mouth: "yawn", t: 7.4},
+    {uaL: -165, faL: -178, uaR: 150, faR: 172, thL: -82, shL: -6, thR: 82, shR: 6, hx: 0, hy: 0, hdx: 0, hdy: -1, walk: 0, eyes: "shut", mouth: "yawn", t: 8.8},
+    {uaL: -12, faL: 55, uaR: 12, faR: -55, thL: -82, shL: -6, thR: 82, shR: 6, hx: 0, hy: 0, hdx: 0, hdy: 0, walk: 0, eyes: "droop", mouth: "pout", t: 9.6},
+    {uaL: -12, faL: 55, uaR: 12, faR: -55, thL: -82, shL: -6, thR: 82, shR: 6, hx: 0, hy: 0, hdx: 1, hdy: 1, walk: 0, eyes: "shut", mouth: "pout", t: 10.8},
+    {uaL: -12, faL: 55, uaR: 12, faR: -55, thL: -82, shL: -6, thR: 82, shR: 6, hx: 0, hy: 0, hdx: 1, hdy: 1, walk: 0, eyes: "shut", mouth: "pout", t: 12.0}
+  ]
+  // Asleep on the last sliver (8 s), rocked by the moon, dreaming of a full one.
+  let sleepKeys = [
+    {uaL: -8, faL: -2, uaR: 8, faR: 2, thL: -82, shL: -4, thR: 82, shR: 4, hx: 0, hy: 0, hdx: -1, hdy: 2, walk: 0, eyes: "shut", mouth: "pout", t: 0.0},
+    {uaL: -8, faL: -2, uaR: 8, faR: 2, thL: -82, shL: -4, thR: 82, shR: 4, hx: 0, hy: 0, hdx: -1, hdy: 2, walk: 0, eyes: "shut", mouth: "pout", t: 3.0},
+    {uaL: -8, faL: -2, uaR: 8, faR: 2, thL: -82, shL: -4, thR: 82, shR: 4, hx: 0, hy: 0, hdx: -1, hdy: 1, walk: 0, eyes: "shut", mouth: "smile", t: 4.0},
+    {uaL: -8, faL: -2, uaR: 8, faR: 2, thL: -82, shL: -4, thR: 82, shR: 4, hx: 0, hy: 0, hdx: -1, hdy: 1, walk: 0, eyes: "shut", mouth: "smile", t: 6.4},
+    {uaL: -8, faL: -2, uaR: 8, faR: 2, thL: -82, shL: -4, thR: 82, shR: 4, hx: 0, hy: 0, hdx: -1, hdy: 2, walk: 0, eyes: "shut", mouth: "pout", t: 7.2},
+    {uaL: -8, faL: -2, uaR: 8, faR: 2, thL: -82, shL: -4, thR: 82, shR: 4, hx: 0, hy: 0, hdx: -1, hdy: 2, walk: 0, eyes: "shut", mouth: "pout", t: 8.0}
+  ]
+  let mandolin = ["oo..............", "omoo......ooooo.", ".ommoo...ommmmmo", "..oommoooommnnmm", "....oommmmmnnnmo", "......ommmmmnmmo", ".......ommmmmmo.", "........oooooo.."]
+  let noteArt = ["..yy", "..y.", "yyy.", "yy.."]
+  let heartArt = [".y.y.", "yyyyy", ".yyy.", "..y.."]
+  let zzArt = ["yyy", "..y", ".y.", "y..", "yyy"]
+  let zSmall = ["yyy", ".y.", "yyy"]
+  // Where the moon sits for each of his poses.
+  let moonPos = {seek: [118, 30], sit: [116, 47], play: [120, 28], serenade: [118, 30], doze: [112, 41], sleep: [110, 46]}
+  let restT = {seek: 6, sit: 1, play: 1.5, serenade: 1, doze: 2, sleep: 1}
+  // The 3x5 pixel font: x is lit.
+  let font = {
+    " ": ["...", "...", "...", "...", "..."], "A": [".x.", "x.x", "xxx", "x.x", "x.x"], "B": ["xx.", "x.x", "xx.", "x.x", "xx."],
+    "C": [".xx", "x..", "x..", "x..", ".xx"], "D": ["xx.", "x.x", "x.x", "x.x", "xx."], "E": ["xxx", "x..", "xxx", "x..", "xxx"],
+    "F": ["xxx", "x..", "xx.", "x..", "x.."], "G": [".xx", "x..", "x.x", "x.x", ".xx"], "H": ["x.x", "x.x", "xxx", "x.x", "x.x"],
+    "I": ["xxx", ".x.", ".x.", ".x.", "xxx"], "J": ["..x", "..x", "..x", "x.x", ".x."], "K": ["x.x", "x.x", "xx.", "x.x", "x.x"],
+    "L": ["x..", "x..", "x..", "x..", "xxx"], "M": ["x.x", "xxx", "xxx", "x.x", "x.x"], "N": ["xx.", "x.x", "x.x", "x.x", "x.x"],
+    "O": [".x.", "x.x", "x.x", "x.x", ".x."], "P": ["xx.", "x.x", "xx.", "x..", "x.."], "Q": [".x.", "x.x", "x.x", "xx.", ".xx"],
+    "R": ["xx.", "x.x", "xx.", "x.x", "x.x"], "S": [".xx", "x..", ".x.", "..x", "xx."], "T": ["xxx", ".x.", ".x.", ".x.", ".x."],
+    "U": ["x.x", "x.x", "x.x", "x.x", "xxx"], "V": ["x.x", "x.x", "x.x", "x.x", ".x."], "W": ["x.x", "x.x", "xxx", "xxx", "x.x"],
+    "X": ["x.x", "x.x", ".x.", "x.x", "x.x"], "Y": ["x.x", "x.x", ".x.", ".x.", ".x."], "Z": ["xxx", "..x", ".x.", "x..", "xxx"],
+    "0": ["xxx", "x.x", "x.x", "x.x", "xxx"], "1": [".x.", "xx.", ".x.", ".x.", "xxx"], "2": ["xxx", "..x", "xxx", "x..", "xxx"],
+    "3": ["xxx", "..x", "xxx", "..x", "xxx"], "4": ["x.x", "x.x", "xxx", "..x", "..x"], "5": ["xxx", "x..", "xxx", "..x", "xxx"],
+    "6": ["xxx", "x..", "xxx", "x.x", "xxx"], "7": ["xxx", "..x", "..x", "..x", "..x"], "8": ["xxx", "x.x", "xxx", "x.x", "xxx"],
+    "9": ["xxx", "x.x", "xxx", "..x", "xxx"], "°": [".x.", "x.x", ".x.", "...", "..."], "-": ["...", "...", "xxx", "...", "..."],
+    "↑": [".x.", "xxx", ".x.", ".x.", ".x."], "↓": [".x.", ".x.", ".x.", "xxx", ".x."], ".": ["...", "...", "...", "...", ".x."],
+    ",": ["...", "...", "...", ".x.", "x.."], ":": ["...", ".x.", "...", ".x.", "..."], "/": ["..x", "..x", ".x.", "x..", "x.."],
+    "'": [".x.", ".x.", "...", "...", "..."], "(": [".x.", "x..", "x..", "x..", ".x."], ")": [".x.", "..x", "..x", "..x", ".x."],
+    "+": ["...", ".x.", "xxx", ".x.", "..."], "%": ["x.x", "..x", ".x.", "x..", "x.x"], "@": ["xxx", "x.x", "x.x", "x..", ".xx"],
+    "·": ["...", "...", ".x.", "...", "..."], "_": ["...", "...", "...", "...", "xxx"], "!": [".x.", ".x.", ".x.", "...", ".x."],
+    "?": ["xx.", "..x", ".x.", "...", ".x."], "#": ["x.x", "xxx", "x.x", "xxx", "x.x"], "&": [".x.", "x.x", ".x.", "x.x", ".xx"],
+    "=": ["...", "xxx", "...", "xxx", "..."], "<": ["..x", ".x.", "x..", ".x.", "..x"], ">": ["x..", ".x.", "..x", ".x.", "x.."],
+    "[": ["xx.", "x..", "x..", "x..", "xx."], "]": [".xx", "..x", "..x", "..x", ".xx"], "*": ["...", "x.x", ".x.", "x.x", "..."],
+    "~": ["...", ".x.", "x.x", "...", "..."], "↗": [".xx", "..x", ".x.", "x..", "..."], "À": [".x.", "x.x", "xxx", "x.x", "x.x"],
+    "Á": [".x.", "x.x", "xxx", "x.x", "x.x"], "Â": [".x.", "x.x", "xxx", "x.x", "x.x"], "Ã": [".x.", "x.x", "xxx", "x.x", "x.x"],
+    "Ä": [".x.", "x.x", "xxx", "x.x", "x.x"], "Å": [".x.", "x.x", "xxx", "x.x", "x.x"], "Ç": [".xx", "x..", "x..", "x..", ".xx"],
+    "È": ["xxx", "x..", "xxx", "x..", "xxx"], "É": ["xxx", "x..", "xxx", "x..", "xxx"], "Ê": ["xxx", "x..", "xxx", "x..", "xxx"],
+    "Ë": ["xxx", "x..", "xxx", "x..", "xxx"], "Ì": ["xxx", ".x.", ".x.", ".x.", "xxx"], "Í": ["xxx", ".x.", ".x.", ".x.", "xxx"],
+    "Î": ["xxx", ".x.", ".x.", ".x.", "xxx"], "Ï": ["xxx", ".x.", ".x.", ".x.", "xxx"], "Ñ": ["xx.", "x.x", "x.x", "x.x", "x.x"],
+    "Ò": [".x.", "x.x", "x.x", "x.x", ".x."], "Ó": [".x.", "x.x", "x.x", "x.x", ".x."], "Ô": [".x.", "x.x", "x.x", "x.x", ".x."],
+    "Õ": [".x.", "x.x", "x.x", "x.x", ".x."], "Ö": [".x.", "x.x", "x.x", "x.x", ".x."], "Ù": ["x.x", "x.x", "x.x", "x.x", "xxx"],
+    "Ú": ["x.x", "x.x", "x.x", "x.x", "xxx"], "Û": ["x.x", "x.x", "x.x", "x.x", "xxx"], "Ü": ["x.x", "x.x", "x.x", "x.x", "xxx"],
+    "Ý": ["x.x", "x.x", ".x.", ".x.", ".x."]
+  }
+  let unknownGlyph = ["x.x", ".x.", "x.x", ".x.", "x.x"]
+  // Scene sprites: b body, s shade, h highlight, y bolt.
+  let sunArt = [
+    ".....bbb.....",
+    "...bbbbbbb...",
+    "..hhhbbbbbb..",
+    ".bhhhhbbbbbb.",
+    ".bhhhhbbbbbs.",
+    "bbbhhbbbbbbss",
+    "bbbbbbbbbbbss",
+    "bbbbbbbbbbbss",
+    ".bbbbbbbbbbs.",
+    ".bbbbbbbbbss.",
+    "..bbbbbbbss..",
+    "...bssssss...",
+    ".....sss....."
+  ]
+  let cloudBig = [
+    "..........hhhh..........",
+    "........hhbbbbhh..hhh...",
+    ".......hbbbbbbbbhhbbbh..",
+    "....hhhbbbbbbbbbbbbbbbh.",
+    "...hbbbbbbbbbbbbbbbbbbh.",
+    "..hbbbbbbbbbbbbbbbbbbbbh",
+    ".hbbbbbbbbbbbbbbbbbbbbbb",
+    ".bbbbbbbbbbbbbbbbbbbbbbs",
+    ".sbbbbbbbbbbbbbbbbbbbbss",
+    "..ssssssssssssssssssss.."
+  ]
+  let cloudSmall = [
+    ".......hhh......",
+    ".....hhbbbh.hh..",
+    "....hbbbbbbhbbh.",
+    "..hhbbbbbbbbbbbh",
+    ".hbbbbbbbbbbbbbb",
+    ".sbbbbbbbbbbbbbs",
+    "..sssssssssssss."
+  ]
+  let boltArt = [
+    "..yyy",
+    "..yy.",
+    ".yy..",
+    ".yyyy",
+    "..yy.",
+    ".yy..",
+    "yy...",
+    "y...."
+  ]
+
+  onTap: { wakeAt = wakeClock; screen() }
+
+  Box {
+    fill: true
+    // The still layer, drawn once: the date board as it stands, the divider, the temperature and text.
+    Canvas {
+      fill: true
+      let p = cell
+      let ox = floor((width / p - 175) / 2)
+      let oy = floor((height / p - 47) / 2)
+      rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+      for w in board {
+        for j in range(len(w.t)) {
+          let cx = ox + 3 + w.x + j * 9
+          let cy = oy + 8 + w.y
+          rect(cx * p, cy * p, 8 * p, 14 * p, fill: mix(background, foreground, 0.16))
+          sprite(get(font, sub(w.t, j, j + 1), blankGlyph), (cx + 1) * p, (cy + 2) * p, 2 * p, color: w.c)
+          line(cx * p, (cy + 7) * p, (cx + 8) * p, (cy + 7) * p, stroke: background, width: p * 0.7)
+        }
+      }
+      for j in range(23) {
+        rect((ox + 72) * p, (oy + 1 + j * 2) * p, p, p, fill: alpha(muted, 0.25))
+      }
+
+      // Beside it: conditions, the temperature (its color from cold blue to hot red), today's high and low, the town.
+      let tx = ox + 128
+      for i in range(len(tStr)) {
+        sprite(get(font, sub(tStr, i, i + 1), blankGlyph), (tx + i * 4 * tk) * p, (oy + 13) * p, tk * p, color: tColor)
+      }
+      if cur != null {
+        let hiT = "↑${get(day, "maxtemp" + unit)}°"
+        let loT = "↓${get(day, "mintemp" + unit)}°"
+        for i in range(len(hiT)) {
+          sprite(get(font, sub(hiT, i, i + 1), blankGlyph), (tx + i * 4) * p, (oy + 32) * p, p, color: i == 0 ? orange : foreground)
+        }
+        for i in range(len(loT)) {
+          sprite(get(font, sub(loT, i, i + 1), blankGlyph), (tx + 20 + i * 4) * p, (oy + 32) * p, p, color: i == 0 ? cyan : muted)
+        }
+      }
+      for it in ticker {
+        if len(it.t) * 4 <= 46 {
+          for i in range(len(it.t)) {
+            sprite(get(font, sub(it.t, i, i + 1), blankGlyph), (tx + i * 4) * p, (oy + it.y) * p, p, color: it.c)
+          }
+        }
+      }
+    }
+    // The moving layer: cards still flipping, the weather scene, a long line scrolling, and the grid on top.
+    Canvas {
+      fill: true
+      let p = cell
+      let ox = floor((width / p - 175) / 2)
+      let oy = floor((height / p - 47) / 2)
+      let tt = animOn ? time : 6
+      for w in board {
+        for j in range(len(w.t)) {
+          let gi = w.g + j
+          let cx = ox + 3 + w.x + j * 9
+          let cy = oy + 8 + w.y
+          let t0 = 0.25 + gi * 0.06
+          let nFlips = 4 + (gi * 3) % 4
+          let u = tt - t0
+          let flipping = u >= 0 && u < nFlips * 0.07
+          if u < nFlips * 0.07 {
+          let r = (gi * 7 + floor(u / 0.07) * 11) % 36
+          let ch = u < 0 ? " " : flipping ? sub(flipSet, r, r + 1) : sub(w.t, j, j + 1)
+          rect(cx * p, cy * p, 8 * p, 14 * p, fill: mix(background, foreground, 0.16))
+          sprite(get(font, ch, blankGlyph), (cx + 1) * p, (cy + 2) * p, 2 * p, color: w.c)
+          if flipping {
+            // The falling flap folds over the top half, then unfolds over the bottom.
+            let f = (u % 0.07) / 0.07
+            if f < 0.5 {
+              rect(cx * p, (cy + floor(f * 14)) * p, 8 * p, (7 - floor(f * 14)) * p, fill: mix(background, foreground, 0.32))
+            }
+            if f >= 0.5 {
+              rect(cx * p, (cy + 7) * p, 8 * p, floor((f - 0.5) * 14) * p, fill: mix(background, foreground, 0.32))
+            }
+          }
+          // The split between the two flaps.
+          line(cx * p, (cy + 7) * p, (cx + 8) * p, (cy + 7) * p, stroke: background, width: p * 0.7)
+          }
+        }
+      }
+      // The weather, as a scene: 48 x 38 cells, with a ground line.
+      let sx = ox + 76
+      let sy = oy + 4
+      let gr = sy + 36
+      let bright = kind == "partly" || kind == "cloudy" || kind == "fog"
+      let cFill = bright ? mix(foreground, background, dark ? 0.4 : 0.12) : mix(foreground, background, 0.48)
+      let cShade = bright ? mix(foreground, background, dark ? 0.62 : 0.42) : mix(foreground, background, 0.7)
+      let cTop = bright ? foreground : mix(foreground, background, 0.3)
+      let flash = kind == "storm" && (tt % 4.2 < 0.12 || (tt % 4.2 > 0.22 && tt % 4.2 < 0.3))
+      clip(sx * p, sy * p, 48 * p, 38 * p) {
+        if flash {
+          rect(sx * p, sy * p, 48 * p, 38 * p, fill: alpha(foreground, 0.14))
+        }
+        // What of the sky shows through: all of it when clear or partly cloudy, the sun's disc through fog.
+        let skyOpen = kind == "clear" || kind == "partly"
+        let veil = kind == "fog" ? 0.35 : 1
+        // Twilight: the horizon glows while the sun is just under or over it.
+        let dusk = clamp(1 - abs(sunAlt + 1) / 8, 0, 1)
+        if skyOpen && dusk > 0 {
+          for k in range(8) {
+            rect(sx * p, (gr - 1 - k) * p, 48 * p, p, fill: alpha(orange, dusk * (0.3 - k * 0.035)))
+          }
+        }
+        // Stars fade in through twilight.
+        if skyOpen && sunAlt < -2 {
+          for k in range(7) {
+            rect((sx + starX[k]) * p, (sy + starY[k]) * p, p, p, fill: alpha(foreground, clamp((-sunAlt - 2) / 8, 0, 1) * (0.2 + 0.6 * abs(sin(tt * 1.3 + k * 2.1)))))
+          }
+        }
+        // The moon and the sun where they are, cut off by the horizon (paler by day, for the moon).
+        clip(sx * p, sy * p, 48 * p, (gr - sy) * p) {
+          if (skyOpen || kind == "fog") && moonAlt > -4 && dark {
+            let mx = sx + round(moonXY.x)
+            let my = sy + moonXY.y
+            sprite(moonNow, (mx - 6) * p, (my - 6) * p, p, palette: {l: alpha(mix(yellow, foreground, 0.55), veil), d: alpha(foreground, veil * 0.12)})
+          }
+          if (skyOpen || kind == "fog") && sunAlt > -4 {
+            let bx = sx + round(sunXY.x)
+            let by = sy + sunXY.y
+            if skyOpen {
+              for k in range(8) {
+                let a = rad(k * 45 + tt * 25)
+                for rr in range(2 + (k + floor(tt * 2)) % 2) {
+                  rect(round(bx + cos(a) * (8 + rr)) * p, round(by + sin(a) * (8 + rr)) * p, p, p, fill: alpha(yellow, 0.9 - rr * 0.3))
+                }
+              }
+            }
+            sprite(sunArt, (bx - 6) * p, (by - 6) * p, p, palette: {b: alpha(yellow, veil), s: alpha(orange, veil), h: alpha(mix(yellow, foreground, 0.6), veil)})
+          }
+        }
+        // Clouds: one drifting across the sun, or a slow sky of them.
+        if kind == "partly" {
+          sprite(cloudBig, (sx + 20 + round(sin(tt * 0.35) * 5)) * p, (sy + 15) * p, p, palette: {b: cFill, s: cShade, h: cTop})
+        }
+        if kind == "cloudy" || kind == "rain" || kind == "snow" || kind == "storm" {
+          sprite(cloudSmall, (sx - 16 + floor((tt * 2.2) % 64)) * p, (sy + 2) * p, p, palette: {b: cShade, s: mix(cShade, background, 0.4), h: cFill})
+          sprite(cloudBig, (sx + 12 + round(sin(tt * 0.4) * (kind == "cloudy" ? 4 : 2))) * p, (sy + 6) * p, p, palette: {b: cFill, s: cShade, h: cTop})
+        }
+        if kind == "cloudy" {
+          sprite(cloudSmall, (sx + 47 - floor((tt * 3.1 + 20) % 64)) * p, (sy + 18) * p, p, palette: {b: cFill, s: cShade, h: cTop})
+        }
+        // Rain falls from the cloud and splashes on the ground; storms add lightning.
+        if kind == "rain" || kind == "storm" {
+          for k in range(9) {
+            let dx = sx + 14 + (k * 5) % 22
+            let t = (tt * 1.6 + k * 0.37) % 1
+            let dy = sy + 16 + floor(t * 20)
+            if dy < gr - 1 {
+              rect(dx * p, dy * p, p, 2 * p, fill: alpha(cyan, 0.85))
+            }
+            if t > 0.93 {
+              rect((dx - 1) * p, (gr - 1) * p, p, p, fill: alpha(cyan, 0.6))
+              rect((dx + 1) * p, (gr - 1) * p, p, p, fill: alpha(cyan, 0.6))
+            }
+          }
+        }
+        if flash {
+          sprite(boltArt, (sx + 20) * p, (sy + 15) * p, 2 * p, palette: {y: yellow})
+        }
+        // Snow drifts down, swaying.
+        if kind == "snow" {
+          for k in range(10) {
+            let t = (tt * 0.35 + k * 0.29) % 1
+            let fx = sx + 13 + snowX[k] + round(sin(tt * 2 + k) * 1.5)
+            let fy = sy + 16 + floor(t * 19)
+            rect(fx * p, fy * p, p, p, fill: foreground)
+            if k % 3 == 0 {
+              rect((fx - 1) * p, fy * p, 3 * p, p, fill: alpha(foreground, 0.5))
+              rect(fx * p, (fy - 1) * p, p, 3 * p, fill: alpha(foreground, 0.5))
+            }
+          }
+        }
+        // Fog: bands of mist sliding past each other.
+        if kind == "fog" {
+          for k in range(5) {
+            let off = floor((tt * (2 + k % 3)) % 12)
+            for s in range(5) {
+              rect((sx + (s * 12 + (k % 2 == 0 ? off : 12 - off)) % 48 - 4) * p, (sy + 8 + k * 5) * p, 8 * p, p, fill: alpha(foreground, 0.4 - k * 0.05))
+            }
+          }
+        }
+        for i in range(24) {
+          rect((sx + i * 2) * p, gr * p, p, p, fill: kind == "snow" ? alpha(foreground, 0.6) : alpha(muted, 0.35))
+        }
+      }
+
+      let tx = ox + 128
+      for it in ticker {
+        let tw = len(it.t) * 4
+        if tw > 46 {
+          let off = max(0, floor((tt * 6) % (tw + 18)) - 12)
+          clip(tx * p, (oy + it.y) * p, 46 * p, 5 * p) {
+            rect(tx * p, (oy + it.y) * p, 46 * p, 5 * p, fill: mix(background, foreground, 0.05))
+            for i in range(len(it.t)) {
+              sprite(get(font, sub(it.t, i, i + 1), blankGlyph), (tx + i * 4 - off) * p, (oy + it.y) * p, p, color: it.c)
+            }
+          }
+        }
+      }
+      // The grid as two zig-zag paths (one line per row and column cost ~220 draws a frame).
+      path(range(2 * (floor(width / p) + 1)).map(n => [floor(n / 2) * p, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+      path(range(2 * (floor(height / p) + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * p]), stroke: background, width: 0.35)
+    }
+  }
+
+  screen {
+    title: "weather"
+    Column {
+      scroll: true
+      gap: 0
+      // Where to look, first: the box searches for a place as it's typed and lists the top matches under it; a
+      // tap pins one. Under that, where the forecast is from, and while a place is pinned, a button back to
+      // following you.
+      Input { text: query; placeholder: place != "" ? "search another place" : "search a place (now following you by network)"; fill: width; onChange: { query = value; searchAt = wakeClock + 2 }; onSubmit: { query = value; refresh() } }
+      Spacer { height: 10 }
+      if trim(query) != "" {
+        Row {
+          gap: 0
+          Canvas {
+            weight: 120
+            height: 14 * screenWidth / 160
+            let q = width / 120
+            let rowsN = floor(height / q)
+            let hd = len(picks) > 0 ? "TOP MATCHES, TAP ONE" : found != null && found.ok ? "NO MATCH" : "SEARCHING..."
+            rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+            for j in range(len(hd)) {
+              sprite(get(font, sub(hd, j, j + 1), unknownGlyph), (2 + j * 4) * q, 5 * q, q, color: muted)
+            }
+            path(range(2 * 121).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+            path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+          }
+          Canvas {
+            weight: 40
+            height: 14 * screenWidth / 160
+            onTap: { query = ""; refresh() }
+            let q = width / 40
+            let rowsN = floor(height / q)
+            let t = "CLOSE"
+            rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+            rect(6 * q, 2 * q, 30 * q, 10 * q, fill: alpha(muted, 0.18))
+            for j in range(len(t)) {
+              sprite(get(font, sub(t, j, j + 1), unknownGlyph), (11 + j * 4) * q, 5 * q, q, color: foreground)
+            }
+            path(range(2 * 41).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+            path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+          }
+        }
+        for h in picks key h.label {
+          Canvas {
+            fill: width
+            height: 14 * screenWidth / 160
+            onTap: { place = "${h.lat},${h.lon}"; placeName = h.name; query = "" }
+            let q = width / 160
+            let rowsN = floor(height / q)
+            let t = upper(h.label)
+            rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+            for j in range(min(len(t), 39)) {
+              sprite(get(font, sub(t, j, j + 1), unknownGlyph), (2 + j * 4) * q, 5 * q, q, color: j < len(h.name) ? foreground : muted)
+            }
+            path(range(2 * 161).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+            path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+          }
+        }
+        if found != null && found.ok && len(picks) == 0 {
+          Canvas {
+            fill: width
+            height: 14 * screenWidth / 160
+            let q = width / 160
+            let rowsN = floor(height / q)
+            let t = "CHECK THE SPELLING, OR A NEARBY TOWN"
+            rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+            for j in range(len(t)) {
+              sprite(get(font, sub(t, j, j + 1), unknownGlyph), (2 + j * 4) * q, 5 * q, q, color: foreground)
+            }
+            path(range(2 * 161).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+            path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+          }
+        }
+        Spacer { height: 10 }
+      }
+      Row {
+        gap: 0
+        Canvas {
+          weight: 110
+          height: 16 * screenWidth / 160
+          let q = width / 110
+          let rowsN = floor(height / q)
+          rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+          for j in range(min(len(viaText), 26)) {
+            sprite(get(font, sub(viaText, j, j + 1), unknownGlyph), (2 + j * 4) * q, 6 * q, q, color: muted)
+          }
+          path(range(2 * 111).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+          path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+        }
+        if place != "" {
+          Canvas {
+            weight: 50
+            height: 16 * screenWidth / 160
+            onTap: place = ""
+            let q = width / 50
+            let rowsN = floor(height / q)
+            let t = "FOLLOW ME"
+            rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+            rect(4 * q, 3 * q, 44 * q, 11 * q, fill: alpha(muted, 0.18))
+            for j in range(len(t)) {
+              sprite(get(font, sub(t, j, j + 1), unknownGlyph), (8 + j * 4) * q, 6 * q, q, color: foreground)
+            }
+            path(range(2 * 51).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+            path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+          }
+        } else {
+          Canvas {
+            weight: 50
+            height: 16 * screenWidth / 160
+            let q = width / 50
+            let rowsN = floor(height / q)
+            rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+            path(range(2 * 51).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+            path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+          }
+        }
+      }
+      // Now: the tile's scene at twice the size (each of its pixels is 2x2 cells of the grid), and beside it
+      // the conditions, temperature, feels-like, high and low, and where.
+      Canvas {
+        onTap: wakeAt = wakeClock
+        fill: width
+        height: 80 * screenWidth / 160
+        let q = width / 160
+        let tt = animOn ? time : 6
+        let p = 2 * q
+        let rowsN = floor(height / q)
+        rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+        let sx = 1
+        let sy = 1
+        let gr = sy + 36
+        let bright = kind == "partly" || kind == "cloudy" || kind == "fog"
+        let cFill = bright ? mix(foreground, background, dark ? 0.4 : 0.12) : mix(foreground, background, 0.48)
+        let cShade = bright ? mix(foreground, background, dark ? 0.62 : 0.42) : mix(foreground, background, 0.7)
+        let cTop = bright ? foreground : mix(foreground, background, 0.3)
+        let flash = kind == "storm" && (tt % 4.2 < 0.12 || (tt % 4.2 > 0.22 && tt % 4.2 < 0.3))
+        clip(sx * p, sy * p, 48 * p, 38 * p) {
+          if flash {
+            rect(sx * p, sy * p, 48 * p, 38 * p, fill: alpha(foreground, 0.14))
+          }
+          // What of the sky shows through: all of it when clear or partly cloudy, the sun's disc through fog.
+          let skyOpen = kind == "clear" || kind == "partly"
+          let veil = kind == "fog" ? 0.35 : 1
+          // Twilight: the horizon glows while the sun is just under or over it.
+          let dusk = clamp(1 - abs(sunAlt + 1) / 8, 0, 1)
+          if skyOpen && dusk > 0 {
+            for k in range(8) {
+              rect(sx * p, (gr - 1 - k) * p, 48 * p, p, fill: alpha(orange, dusk * (0.3 - k * 0.035)))
+            }
+          }
+          // Stars fade in through twilight.
+          if skyOpen && sunAlt < -2 {
+            for k in range(7) {
+              rect((sx + starX[k]) * p, (sy + starY[k]) * p, p, p, fill: alpha(foreground, clamp((-sunAlt - 2) / 8, 0, 1) * (0.2 + 0.6 * abs(sin(tt * 1.3 + k * 2.1)))))
+            }
+          }
+          // The moon and the sun where they are, cut off by the horizon (paler by day, for the moon).
+          clip(sx * p, sy * p, 48 * p, (gr - sy) * p) {
+            if (skyOpen || kind == "fog") && moonAlt > -4 && dark {
+              let mx = sx + round(moonXY.x)
+              let my = sy + moonXY.y
+              sprite(moonNow, (mx - 6) * p, (my - 6) * p, p, palette: {l: alpha(mix(yellow, foreground, 0.55), veil), d: alpha(foreground, veil * 0.12)})
+            }
+            if (skyOpen || kind == "fog") && sunAlt > -4 {
+              let bx = sx + round(sunXY.x)
+              let by = sy + sunXY.y
+              if skyOpen {
+                for k in range(8) {
+                  let a = rad(k * 45 + tt * 25)
+                  for rr in range(2 + (k + floor(tt * 2)) % 2) {
+                    rect(round(bx + cos(a) * (8 + rr)) * p, round(by + sin(a) * (8 + rr)) * p, p, p, fill: alpha(yellow, 0.9 - rr * 0.3))
+                  }
+                }
+              }
+              sprite(sunArt, (bx - 6) * p, (by - 6) * p, p, palette: {b: alpha(yellow, veil), s: alpha(orange, veil), h: alpha(mix(yellow, foreground, 0.6), veil)})
+            }
+          }
+          // Clouds: one drifting across the sun, or a slow sky of them.
+          if kind == "partly" {
+            sprite(cloudBig, (sx + 20 + round(sin(tt * 0.35) * 5)) * p, (sy + 15) * p, p, palette: {b: cFill, s: cShade, h: cTop})
+          }
+          if kind == "cloudy" || kind == "rain" || kind == "snow" || kind == "storm" {
+            sprite(cloudSmall, (sx - 16 + floor((tt * 2.2) % 64)) * p, (sy + 2) * p, p, palette: {b: cShade, s: mix(cShade, background, 0.4), h: cFill})
+            sprite(cloudBig, (sx + 12 + round(sin(tt * 0.4) * (kind == "cloudy" ? 4 : 2))) * p, (sy + 6) * p, p, palette: {b: cFill, s: cShade, h: cTop})
+          }
+          if kind == "cloudy" {
+            sprite(cloudSmall, (sx + 47 - floor((tt * 3.1 + 20) % 64)) * p, (sy + 18) * p, p, palette: {b: cFill, s: cShade, h: cTop})
+          }
+          // Rain falls from the cloud and splashes on the ground; storms add lightning.
+          if kind == "rain" || kind == "storm" {
+            for k in range(9) {
+              let dx = sx + 14 + (k * 5) % 22
+              let t = (tt * 1.6 + k * 0.37) % 1
+              let dy = sy + 16 + floor(t * 20)
+              if dy < gr - 1 {
+                rect(dx * p, dy * p, p, 2 * p, fill: alpha(cyan, 0.85))
+              }
+              if t > 0.93 {
+                rect((dx - 1) * p, (gr - 1) * p, p, p, fill: alpha(cyan, 0.6))
+                rect((dx + 1) * p, (gr - 1) * p, p, p, fill: alpha(cyan, 0.6))
+              }
+            }
+          }
+          if flash {
+            sprite(boltArt, (sx + 20) * p, (sy + 15) * p, 2 * p, palette: {y: yellow})
+          }
+          // Snow drifts down, swaying.
+          if kind == "snow" {
+            for k in range(10) {
+              let t = (tt * 0.35 + k * 0.29) % 1
+              let fx = sx + 13 + snowX[k] + round(sin(tt * 2 + k) * 1.5)
+              let fy = sy + 16 + floor(t * 19)
+              rect(fx * p, fy * p, p, p, fill: foreground)
+              if k % 3 == 0 {
+                rect((fx - 1) * p, fy * p, 3 * p, p, fill: alpha(foreground, 0.5))
+                rect(fx * p, (fy - 1) * p, p, 3 * p, fill: alpha(foreground, 0.5))
+              }
+            }
+          }
+          // Fog: bands of mist sliding past each other.
+          if kind == "fog" {
+            for k in range(5) {
+              let off = floor((tt * (2 + k % 3)) % 12)
+              for s in range(5) {
+                rect((sx + (s * 12 + (k % 2 == 0 ? off : 12 - off)) % 48 - 4) * p, (sy + 8 + k * 5) * p, 8 * p, p, fill: alpha(foreground, 0.4 - k * 0.05))
+              }
+            }
+          }
+          for i in range(24) {
+            rect((sx + i * 2) * p, gr * p, p, p, fill: kind == "snow" ? alpha(foreground, 0.6) : alpha(muted, 0.35))
+          }
+        }
+
+        let rx = 102
+        let rows1 = [sub(wxDesc, 0, min(len(wxDesc), 14)), len(wxDesc) > 14 ? sub(wxDesc, 14, min(len(wxDesc), 28)) : ""]
+        for r in range(2) {
+          for j in range(len(rows1[r])) {
+            sprite(get(font, sub(rows1[r], j, j + 1), unknownGlyph), (rx + j * 4) * q, (4 + r * 7) * q, q, color: foreground)
+          }
+        }
+        let bigK = len(tStr) > 3 ? 3 : 4
+        for j in range(len(tStr)) {
+          sprite(get(font, sub(tStr, j, j + 1), unknownGlyph), (rx + j * 4 * bigK) * q, 20 * q, bigK * q, color: tColor)
+        }
+        if cur != null {
+          let feels = "FEELS ${get(cur, "FeelsLike" + unit)}°"
+          let hl = "↑${get(day, "maxtemp" + unit)}° ↓${get(day, "mintemp" + unit)}°"
+          for j in range(len(feels)) {
+            sprite(get(font, sub(feels, j, j + 1), unknownGlyph), (rx + j * 4) * q, 44 * q, q, color: muted)
+          }
+          for j in range(len(hl)) {
+            let ch = sub(hl, j, j + 1)
+            sprite(get(font, ch, unknownGlyph), (rx + j * 4) * q, 52 * q, q, color: ch == "↑" ? orange : ch == "↓" ? cyan : foreground)
+          }
+          let where = [upper(town ?? ""), upper(area.country[0].value ?? "")].map(t => sub(t, 0, min(len(t), 14)))
+          for r in range(2) {
+            for j in range(len(where[r])) {
+              sprite(get(font, sub(where[r], j, j + 1), unknownGlyph), (rx + j * 4) * q, (62 + r * 7) * q, q, color: r == 0 ? foreground : muted)
+            }
+          }
+        }
+        path(range(2 * 161).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+        path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+      }
+      // Conditions: six tiles; tapping one opens its hourly chart below (and tapping it again closes it).
+      Canvas {
+        fill: width
+        height: 10 * screenWidth / 160
+        let q = width / 160
+        let rowsN = floor(height / q)
+        let hd = "CONDITIONS"
+        let hint = hourly == null ? "" : "TAP FOR HOURLY"
+        rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+        for j in range(len(hd)) {
+          sprite(get(font, sub(hd, j, j + 1), unknownGlyph), (2 + j * 4 * 1) * q, (3) * q, 1 * q, color: accent)
+        }
+        rect((4 + len(hd) * 4) * q, 5 * q, (152 - len(hd) * 4 - len(hint) * 4) * q, q, fill: alpha(muted, 0.35))
+        for j in range(len(hint)) {
+          sprite(get(font, sub(hint, j, j + 1), unknownGlyph), (158 - len(hint) * 4 + j * 4 * 1) * q, (3) * q, 1 * q, color: muted)
+        }
+        path(range(2 * (160 + 1)).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+        path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+      }
+      if len(wxCond) == 6 {
+        for r in range(3) {
+          Row {
+            gap: 0
+            for c in range(2) {
+              Canvas {
+                weight: 80
+                height: 22 * screenWidth / 160
+                onTap: { wakeAt = wakeClock; detail = detail == wxCond[r * 2 + c].m || hourly == null ? "" : wxCond[r * 2 + c].m; openedAt = time }
+                let q = width / 80
+                let rowsN = floor(height / q)
+                let it = wxCond[r * 2 + c]
+                let sel = detail == it.m
+                let lab = sub(it.l, 0, min(len(it.l), 17))
+                let val = sub(it.v, 0, min(len(it.v), 9))
+                let chev = hourly == null ? "" : sel ? "↓" : ">"
+                rect(0, 0, width, height, fill: sel ? alpha(accent, 0.14) : alpha(foreground, 0.05))
+                for j in range(len(lab)) {
+                  sprite(get(font, sub(lab, j, j + 1), unknownGlyph), (2 + j * 4) * q, 4 * q, q, color: sel ? accent : muted)
+                }
+                for j in range(len(chev)) {
+                  sprite(get(font, chev, unknownGlyph), 74 * q, 4 * q, q, color: sel ? accent : alpha(muted, 0.6))
+                }
+                for j in range(len(val)) {
+                  sprite(get(font, sub(val, j, j + 1), unknownGlyph), (2 + j * 8) * q, 11 * q, 2 * q, color: it.c)
+                }
+                path(range(2 * (80 + 1)).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+                path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+              }
+            }
+          }
+        }
+      }
+      // The opened tile's hourly chart: twelve hours in view (tap the left or right third to move six), animated
+      // as it opens (bars grow, arrows spin in, the line draws itself) and alive while it stays open.
+      if detail != "" && hourly != null {
+        Canvas {
+          fill: width
+          height: 74 * screenWidth / 160
+          onTap: { wakeAt = wakeClock; hScroll = clamp(hScroll + (x < screenWidth / 3 ? -6 : x > screenWidth * 2 / 3 ? 6 : 0), 0, lastOffs) }
+          let q = width / 160
+        let tt = animOn ? time : openedAt + 30
+          let rowsN = floor(height / q)
+          let offs = clamp(floor(hScroll), 0, lastOffs)
+          let u = tt < openedAt ? 1 : clamp((tt - openedAt) / 0.7, 0, 1)
+          let info = get(detailInfo, detail, {t: "", s: ""})
+          let win = hourly.drop(offs).take(12)
+          let hint = "< TAP THE SIDES OR DRAG BELOW >"
+          rect(0, 0, width, height, fill: alpha(accent, 0.06))
+          for j in range(len(info.t)) {
+            sprite(get(font, sub(info.t, j, j + 1), unknownGlyph), (2 + j * 4 * 1) * q, (3) * q, 1 * q, color: accent)
+          }
+          for j in range(len(info.s)) {
+            sprite(get(font, sub(info.s, j, j + 1), unknownGlyph), (2 + j * 4 * 1) * q, (11) * q, 1 * q, color: muted)
+          }
+
+          if detail == "uv" {
+            let top = max(11, max(win.map(h => h.uv)))
+            for i in range(len(win)) {
+              let h = win[i]
+              let ui = clamp(u * 1.8 - i * 0.07, 0, 1)
+              let bh = round(h.uv / top * 34 * ui)
+              let lab = "${round(h.uv)}"
+              rect((5 + i * 13) * q, (58 - bh) * q, 7 * q, bh * q, fill: h.uv < 3 ? green : h.uv < 6 ? yellow : h.uv < 8 ? orange : h.uv < 11 ? red : magenta)
+              for j in range(len(lab)) {
+                sprite(get(font, sub(lab, j, j + 1), unknownGlyph), (8 + i * 13 - len(lab) * 2 + j * 4) * q, (51 - bh) * q, q, color: foreground)
+              }
+            }
+            // The sun beside the title, its rays flickering.
+            sprite(icons.clear, 149 * q, 3 * q, q, palette: {y: alpha(yellow, 0.55 + 0.45 * abs(sin(tt * 3)))})
+          }
+          if detail == "rain" {
+            for i in range(len(win)) {
+              let h = win[i]
+              let ui = clamp(u * 1.8 - i * 0.07, 0, 1)
+              let bh = round(h.pop / 100 * 34 * ui)
+              let lab = "${h.pop}"
+              rect((5 + i * 13) * q, (58 - bh) * q, 7 * q, max(bh, 1) * q, fill: h.pop >= 30 ? cyan : alpha(cyan, 0.45))
+              for j in range(len(lab)) {
+                sprite(get(font, sub(lab, j, j + 1), unknownGlyph), (8 + i * 13 - len(lab) * 2 + j * 4) * q, (51 - bh) * q, q, color: h.pop >= 30 ? foreground : muted)
+              }
+              // Where rain is likely, drops fall into the bar.
+              if h.pop >= 30 && u >= 1 {
+                for k in range(2) {
+                  let t = (tt * 1.3 + i * 0.37 + k * 0.5) % 1
+                  rect((6 + i * 13 + k * 4) * q, (20 + round(t * (30 - bh))) * q, q, 2 * q, fill: alpha(cyan, 0.8))
+                }
+              }
+            }
+          }
+          if detail == "humidity" {
+            for i in range(len(win)) {
+              let h = win[i]
+              let ui = clamp(u * 1.8 - i * 0.07, 0, 1)
+              let fh = round(h.rh / 100 * 34 * ui)
+              let lab = "${h.rh}"
+              rect((5 + i * 13) * q, 24 * q, 7 * q, 34 * q, fill: alpha(muted, 0.15))
+              rect((5 + i * 13) * q, (58 - fh) * q, 7 * q, fh * q, fill: alpha(blue, 0.85))
+              // The surface shimmers.
+              if fh > 0 {
+                rect((5 + i * 13 + (floor(tt * 4) + i) % 2 * 3) * q, (58 - fh) * q, 4 * q, q, fill: alpha(foreground, 0.35))
+              }
+              for j in range(len(lab)) {
+                sprite(get(font, sub(lab, j, j + 1), unknownGlyph), (8 + i * 13 - len(lab) * 2 + j * 4) * q, 18 * q, q, color: foreground)
+              }
+            }
+          }
+          if detail == "wind" {
+            for i in range(len(win)) {
+              let h = win[i]
+              let ui = clamp(u * 1.6 - i * 0.06, 0, 1)
+              let k = round(((h.wd + 180) % 360) / 45) % 8
+              let ks = (k + floor((1 - ui) * 16)) % 8
+              let wk = imperial ? h.ws * 1.609 : h.ws
+              let col = wk < 10 ? alpha(foreground, 0.6) : wk < 20 ? cyan : wk < 35 ? yellow : wk < 50 ? orange : red
+              let bob = ui < 1 ? 0 : floor(tt * (1 + wk / 12) + i * 0.5) % 2
+              let spd = "${h.ws}"
+              let gst = "G${h.wg}"
+              sprite(arrows[ks], (5 + i * 13 + windDX[k] * bob) * q, (24 + windDY[k] * bob) * q, q, color: col)
+              for j in range(len(spd)) {
+                sprite(get(font, sub(spd, j, j + 1), unknownGlyph), (8 + i * 13 - len(spd) * 2 + j * 4) * q, 36 * q, q, color: col)
+              }
+              for j in range(len(gst)) {
+                sprite(get(font, sub(gst, j, j + 1), unknownGlyph), (8 + i * 13 - len(gst) * 2 + j * 4) * q, 46 * q, q, color: muted)
+              }
+            }
+          }
+          if detail == "pressure" {
+            let pmin = min(hourly.map(h => h.p))
+            let pmax = max(hourly.map(h => h.p))
+            let ys = win.map(h => 56 - round((h.p - pmin) / max(pmax - pmin, 1) * 28))
+            let shown = clamp(floor(u * 13), 0, len(win))
+            for i in range(shown) {
+              if i > 0 {
+                line((8 + (i - 1) * 13 + 0.5) * q, (ys[i - 1] + 0.5) * q, (8 + i * 13 + 0.5) * q, (ys[i] + 0.5) * q, stroke: alpha(accent, 0.7), width: q)
+              }
+              rect((7 + i * 13) * q, (ys[i] - 1) * q, 3 * q, 3 * q, fill: offs + i == 0 ? (floor(tt * 2) % 2 == 0 ? yellow : accent) : accent)
+              if (offs + i) % 3 == 0 {
+                let lab = imperial ? fixed(win[i].p * 0.02953, 1) : "${round(win[i].p)}"
+                for j in range(len(lab)) {
+                  sprite(get(font, sub(lab, j, j + 1), unknownGlyph), (8 + i * 13 - len(lab) * 2 + j * 4) * q, (ys[i] - 8) * q, q, color: foreground)
+                }
+              }
+            }
+          }
+          if detail == "visibility" {
+            for i in range(len(win)) {
+              let h = win[i]
+              let ui = clamp(u * 1.8 - i * 0.07, 0, 1)
+              let km = h.vis / 1000
+              let bh = round(min(km, 30) / 30 * 34 * ui)
+              let lab = "${min(round(imperial ? h.vis / 1609 : km), 99)}"
+              rect((5 + i * 13) * q, (58 - bh) * q, 7 * q, max(bh, 1) * q, fill: km < 1 ? red : km < 5 ? orange : km < 10 ? yellow : green)
+              for j in range(len(lab)) {
+                sprite(get(font, sub(lab, j, j + 1), unknownGlyph), (8 + i * 13 - len(lab) * 2 + j * 4) * q, (51 - bh) * q, q, color: foreground)
+              }
+              // Mist drifts through the hours where you can see less than 5 km.
+              if km < 5 {
+                rect((3 + i * 13 + floor(tt * 3 + i) % 6) * q, (30 + i % 3 * 6) * q, 6 * q, q, fill: alpha(foreground, 0.35))
+              }
+            }
+            // As it opens, the mist clears.
+            rect(0, 18 * q, width, 42 * q, fill: alpha(foreground, (1 - u) * 0.4))
+          }
+          // The hours: now, then each hour, with the day at midnight.
+          for i in range(len(win)) {
+            let hh = fmtTime(win[i].t, "HH")
+            let lab = offs + i == 0 ? "NOW" : hh == "00" ? upper(fmtTime(win[i].t, "EEE")) : hh
+            for j in range(len(lab)) {
+              sprite(get(font, sub(lab, j, j + 1), unknownGlyph), (8 + i * 13 - len(lab) * 2 + j * 4) * q, 62 * q, q, color: offs + i == 0 || hh == "00" ? accent : muted)
+            }
+          }
+          for j in range(len(hint)) {
+            sprite(get(font, sub(hint, j, j + 1), unknownGlyph), (80 - len(hint) * 2 + j * 4 * 1) * q, (69) * q, 1 * q, color: alpha(muted, 0.6))
+          }
+          path(range(2 * (160 + 1)).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+          path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+        }
+        // The timeline: drag it to scroll the hours (dragging the chart itself would stop the page scrolling), or tap an hour.
+        Canvas {
+          fill: width
+          height: 12 * screenWidth / 160
+          onDrag: hScroll = clamp(hScroll + dx / (screenWidth / 160) / 3, 0, lastOffs)
+          onTap: hScroll = clamp(round((x / (screenWidth / 160) - 8) / 3) - 6, 0, lastOffs)
+          let q = width / 160
+          let rowsN = floor(height / q)
+          let offs = clamp(floor(hScroll), 0, lastOffs)
+          rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+          for i in range(len(hourly)) {
+            let h = hourly[i]
+            rect((8 + i * 3) * q, 5 * q, 2 * q, 2 * q, fill: fmtTime(h.t, "HH") == "00" ? alpha(accent, 0.8) : h.day ? alpha(foreground, 0.35) : alpha(muted, 0.25))
+          }
+          rect((7 + offs * 3) * q, 3 * q, 37 * q, q, fill: accent)
+          rect((7 + offs * 3) * q, 8 * q, 37 * q, q, fill: accent)
+          sprite(get(font, "<", unknownGlyph), 2 * q, 4 * q, q, color: offs > 0 ? accent : alpha(muted, 0.3))
+          sprite(get(font, ">", unknownGlyph), 155 * q, 4 * q, q, color: offs < lastOffs ? accent : alpha(muted, 0.3))
+          path(range(2 * (160 + 1)).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+          path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+        }
+      }
+      // Until the hourly forecast arrives: wttr's 3-hour steps.
+      if hourly == null {
+        // The next 24 hours: the time, an icon (a moon after dark), the temperature riding a little curve, rain.
+        Canvas {
+          fill: width
+          height: 62 * screenWidth / 160
+          let q = width / 160
+          let rowsN = floor(height / q)
+          let hd = "NEXT 24 HOURS"
+          rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+          for j in range(len(hd)) {
+            sprite(get(font, sub(hd, j, j + 1), unknownGlyph), (2 + j * 4) * q, 3 * q, q, color: accent)
+          }
+          rect((4 + len(hd) * 4) * q, 5 * q, (154 - len(hd) * 4) * q, q, fill: alpha(muted, 0.35))
+          for i in range(len(steps)) {
+            let s = steps[i]
+            let h = ((s.hr % 24) + 24) % 24
+            let mid = 2 + i * 20 + 9
+            let lab = s.hr <= hourNow && hourNow < s.hr + 3 ? "NOW" : pad(int(h), 2, "0")
+            let k = get(kindOf, s.code, "rain")
+            let ik = (k == "clear" || k == "partly") && (h < riseH || h >= setH) ? k + "N" : k
+            let tt = "${s.t}°"
+            let rn = "${s.rain}%"
+            for j in range(len(lab)) {
+              sprite(get(font, sub(lab, j, j + 1), unknownGlyph), (mid - len(lab) * 2 + j * 4) * q, 12 * q, q, color: lab == "NOW" ? accent : muted)
+            }
+            sprite(get(icons, ik, icons.cloudy), (mid - 7) * q, 20 * q, 2 * q, palette: iconPal)
+            for j in range(len(tt)) {
+              sprite(get(font, sub(tt, j, j + 1), unknownGlyph), (mid - len(tt) * 2 + j * 4) * q, (37 + round((tHi - s.t) / max(tHi - tLo, 1) * 6)) * q, q, color: foreground)
+            }
+            for j in range(len(rn)) {
+              sprite(get(font, sub(rn, j, j + 1), unknownGlyph), (mid - len(rn) * 2 + j * 4) * q, 51 * q, q, color: s.rain >= 30 ? cyan : muted)
+            }
+          }
+          path(range(2 * 161).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+          path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+        }
+      }
+      // The next 48 hours, hour by hour: the time, an icon (a moon after dark), the temperature on a little curve,
+      // and the chance of rain. Twelve hours in view; tap the sides or drag the timeline. wttr's 3-hour steps
+      // stand in until the hourly forecast arrives.
+      if hourly != null {
+        Canvas {
+          fill: width
+          height: 62 * screenWidth / 160
+          onTap: hScroll = clamp(hScroll + (x < screenWidth / 3 ? -6 : x > screenWidth * 2 / 3 ? 6 : 0), 0, lastOffs)
+          let q = width / 160
+          let rowsN = floor(height / q)
+          let offs = clamp(floor(hScroll), 0, lastOffs)
+          let win = hourly.drop(offs).take(12)
+          let wLo = min(win.map(h => h.temp))
+          let wHi = max(win.map(h => h.temp))
+          let hd = "NEXT 48 HOURS"
+          rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+          for j in range(len(hd)) {
+            sprite(get(font, sub(hd, j, j + 1), unknownGlyph), (2 + j * 4 * 1) * q, (3) * q, 1 * q, color: accent)
+          }
+          rect((4 + len(hd) * 4) * q, 5 * q, (154 - len(hd) * 4) * q, q, fill: alpha(muted, 0.35))
+          for i in range(len(win)) {
+            let h = win[i]
+            let hh = fmtTime(h.t, "HH")
+            let lab = offs + i == 0 ? "NOW" : hh == "00" ? upper(fmtTime(h.t, "EEE")) : hh
+            let k = get(kindOf, h.code, "rain")
+            let ik = (k == "clear" || k == "partly") && !h.day ? k + "N" : k
+            let tt = "${h.temp}"
+            let rn = "${h.pop}"
+            for j in range(len(lab)) {
+              sprite(get(font, sub(lab, j, j + 1), unknownGlyph), (8 + i * 13 - len(lab) * 2 + j * 4) * q, 12 * q, q, color: offs + i == 0 || hh == "00" ? accent : muted)
+            }
+            sprite(get(icons, ik, icons.cloudy), (5 + i * 13) * q, 20 * q, q, palette: iconPal)
+            for j in range(len(tt)) {
+              sprite(get(font, sub(tt, j, j + 1), unknownGlyph), (8 + i * 13 - len(tt) * 2 + j * 4) * q, (31 + round((wHi - h.temp) / max(wHi - wLo, 1) * 8)) * q, q, color: foreground)
+            }
+            for j in range(len(rn)) {
+              sprite(get(font, sub(rn, j, j + 1), unknownGlyph), (8 + i * 13 - len(rn) * 2 + j * 4) * q, 47 * q, q, color: h.pop >= 30 ? cyan : alpha(muted, 0.8))
+            }
+          }
+          let rl = "RAIN %"
+          for j in range(len(rl)) {
+            sprite(get(font, sub(rl, j, j + 1), unknownGlyph), (2 + j * 4 * 1) * q, (55) * q, 1 * q, color: alpha(muted, 0.6))
+          }
+          path(range(2 * (160 + 1)).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+          path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+        }
+        // The timeline: drag it to scroll the hours (dragging the chart itself would stop the page scrolling), or tap an hour.
+        Canvas {
+          fill: width
+          height: 12 * screenWidth / 160
+          onDrag: hScroll = clamp(hScroll + dx / (screenWidth / 160) / 3, 0, lastOffs)
+          onTap: hScroll = clamp(round((x / (screenWidth / 160) - 8) / 3) - 6, 0, lastOffs)
+          let q = width / 160
+          let rowsN = floor(height / q)
+          let offs = clamp(floor(hScroll), 0, lastOffs)
+          rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+          for i in range(len(hourly)) {
+            let h = hourly[i]
+            rect((8 + i * 3) * q, 5 * q, 2 * q, 2 * q, fill: fmtTime(h.t, "HH") == "00" ? alpha(accent, 0.8) : h.day ? alpha(foreground, 0.35) : alpha(muted, 0.25))
+          }
+          rect((7 + offs * 3) * q, 3 * q, 37 * q, q, fill: accent)
+          rect((7 + offs * 3) * q, 8 * q, 37 * q, q, fill: accent)
+          sprite(get(font, "<", unknownGlyph), 2 * q, 4 * q, q, color: offs > 0 ? accent : alpha(muted, 0.3))
+          sprite(get(font, ">", unknownGlyph), 155 * q, 4 * q, q, color: offs < lastOffs ? accent : alpha(muted, 0.3))
+          path(range(2 * (160 + 1)).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+          path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+        }
+      }
+      // Five days (three if Open-Meteo is down): icon, rain chance, and the low to high on one shared scale.
+      Canvas {
+        fill: width
+        height: (14 + len(forecast) * 10) * screenWidth / 160
+        let q = width / 160
+        let rowsN = floor(height / q)
+        let hd = "${len(forecast)} DAYS"
+        let span = max(highest - lowest, 1)
+        rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+        for j in range(len(hd)) {
+          sprite(get(font, sub(hd, j, j + 1), unknownGlyph), (2 + j * 4) * q, 3 * q, q, color: accent)
+        }
+        rect((4 + len(hd) * 4) * q, 5 * q, (154 - len(hd) * 4) * q, q, fill: alpha(muted, 0.35))
+        for i in range(len(forecast)) {
+          let d = forecast[i]
+          let y = 12 + i * 10
+          let dn = i == 0 ? "TODAY" : upper(fmtTime(now + 86400 * i, "EEE"))
+          let rn = "${d.rain}%"
+          let lo = "${d.lo}°"
+          let hi = "${d.hi}°"
+          let x0 = 72 + round((d.lo - lowest) / span * 66)
+          let x1 = 72 + round((d.hi - lowest) / span * 66)
+          for j in range(len(dn)) {
+            sprite(get(font, sub(dn, j, j + 1), unknownGlyph), (2 + j * 4) * q, y * q, q, color: i == 0 ? accent : foreground)
+          }
+          sprite(get(icons, get(kindOf, d.code, "rain"), icons.cloudy), 24 * q, (y - 1) * q, q, palette: iconPal)
+          for j in range(len(rn)) {
+            sprite(get(font, sub(rn, j, j + 1), unknownGlyph), (34 + j * 4) * q, y * q, q, color: d.rain >= 30 ? cyan : muted)
+          }
+          for j in range(len(lo)) {
+            sprite(get(font, sub(lo, j, j + 1), unknownGlyph), (68 - len(lo) * 4 + j * 4) * q, y * q, q, color: muted)
+          }
+          rect(72 * q, (y + 1) * q, 68 * q, 3 * q, fill: alpha(muted, 0.18))
+          rect(x0 * q, (y + 1) * q, max(x1 - x0 + 2, 3) * q, 3 * q, fill: linear(72 * q, 0, 140 * q, 0, [cyan, green, orange]))
+          for j in range(len(hi)) {
+            sprite(get(font, sub(hi, j, j + 1), unknownGlyph), (144 + j * 4) * q, y * q, q, color: foreground)
+          }
+        }
+        path(range(2 * 161).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+        path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+      }
+      // Sun and moon: a golden-hour scene (dawn over the hills before solar noon, dusk on the Atlantic after) with
+      // today's sunrise, sunset and golden hour; and the moon as it is tonight, with Pierrot keeping it company.
+      Canvas {
+        fill: width
+        height: 10 * screenWidth / 160
+        let q = width / 160
+        let rowsN = floor(height / q)
+        let hd = "SUN & MOON"
+        rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+        for j in range(len(hd)) {
+          sprite(get(font, sub(hd, j, j + 1), unknownGlyph), (2 + j * 4) * q, (3) * q, q, color: accent)
+        }
+        rect((4 + len(hd) * 4) * q, 5 * q, (154 - len(hd) * 4) * q, q, fill: alpha(muted, 0.35))
+        path(range(2 * 161).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+        path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+      }
+      Box {
+        fill: width
+        // The still layer: the panel and the times under the scene.
+        Canvas {
+          fill: width
+          height: 64 * screenWidth / 160
+          let q = width / 160
+          let rowsN = floor(height / q)
+          let hz = 30
+          rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+          // Under the scene: sunrise and sunset, golden hour, the length of the day.
+          let riseT = riseTs == null ? "--:--" : fmtTime(riseTs, "HH:mm")
+          let setT = setTs == null ? "--:--" : fmtTime(setTs, "HH:mm")
+          let rs = "↑ ${riseT}  ↓ ${setT}"
+          let gold = isDawn ? (goldenMornTs == null ? "" : "GOLDEN TILL ${fmtTime(goldenMornTs, "HH:mm")}") : (goldenEveTs == null ? "" : "GOLDEN FROM ${fmtTime(goldenEveTs, "HH:mm")}")
+          let dl = riseTs == null ? "" : upper(fmtDuration(setTs - riseTs)) + " OF DAY"
+          for j in range(len(rs)) {
+            let ch = sub(rs, j, j + 1)
+            sprite(get(font, ch, unknownGlyph), (3 + j * 4) * q, 50 * q, q, color: ch == "↑" ? orange : ch == "↓" ? cyan : foreground)
+          }
+          for j in range(len(gold)) {
+            sprite(get(font, sub(gold, j, j + 1), unknownGlyph), (3 + j * 4) * q, (57) * q, q, color: yellow)
+          }
+          for j in range(len(dl)) {
+            sprite(get(font, sub(dl, j, j + 1), unknownGlyph), (157 - len(dl) * 4 + j * 4) * q, (50) * q, q, color: muted)
+          }
+        }
+        // The moving layer: the sky, the sun, the hills or the sea, birds; the grid on top.
+        Canvas {
+          fill: width
+          height: 64 * screenWidth / 160
+          onTap: wakeAt = wakeClock
+          let q = width / 160
+          let tt = animOn ? time : 3
+          let rowsN = floor(height / q)
+          let hz = 30
+          // Golden-hour sky, top to horizon: dusk burns from violet to gold, dawn blushes from blue to pale gold.
+          let sky = isDawn ? [mix(background, blue, 0.45), mix(blue, magenta, 0.45), mix(magenta, orange, 0.35), mix(orange, foreground, 0.3), mix(yellow, foreground, 0.45)] : [mix(background, magenta, 0.35), mix(magenta, red, 0.5), mix(red, orange, 0.55), orange, mix(orange, yellow, 0.6)]
+          let sxc = isDawn ? 104 : 80
+          // At dawn it climbs out from behind the hills; at dusk it sits on the sea.
+          let syc = (isDawn ? hz - 9 : hz + 1) + round(sin(tt * 0.5) * 2)
+          let glow = 0.12 + 0.06 * sin(tt * 2)
+          for b in range(5) {
+            rect(0, b * 6 * q, 160 * q, 6 * q, fill: sky[b])
+          }
+          // Softened seams between the bands: two blended rows each (a checkerboard cost 640 draws a frame).
+          for b in range(4) {
+            rect(0, (b * 6 + 5) * q, 160 * q, q, fill: mix(sky[b], sky[b + 1], 0.35))
+            rect(0, (b * 6 + 6) * q, 160 * q, q, fill: mix(sky[b], sky[b + 1], 0.65))
+          }
+          // The sun, breathing on the horizon inside a pulsing halo, lighter at its top.
+          clip(0, 0, 160 * q, hz * q) {
+            for r in [14, 11] {
+              for dy in range(-r, r + 1) {
+                let w = floor(sqrt(r * r - dy * dy))
+                rect((sxc - w) * q, (syc + dy) * q, (2 * w + 1) * q, q, fill: alpha(yellow, glow * (r == 14 ? 0.6 : 1)))
+              }
+            }
+            for dy in range(-8, 9) {
+              let w = floor(sqrt(64 - dy * dy))
+              rect((sxc - w) * q, (syc + dy) * q, (2 * w + 1) * q, q, fill: dy < -4 ? mix(yellow, foreground, isDawn ? 0.15 : 0.45) : dy < 1 ? yellow : mix(yellow, orange, 0.6))
+            }
+          }
+          if isDawn {
+            // Hills, far and near, the sun coming up behind them; morning mist drifting across.
+            sprite(hillRows, 0, 23 * q, q, palette: {f: mix(sky[1], background, 0.45), n: mix(background, sky[0], 0.25)})
+            for k in range(3) {
+              rect(((tt * (2 + k) + k * 60) % 190 - 30) * q, (hz - 1 + k * 4) * q, 30 * q, q, fill: alpha(foreground, 0.16))
+            }
+          } else {
+            // The Atlantic: bands deepening toward the shore, the sun's golden path shimmering, sparkles winking.
+            for k in range(16) {
+              rect(0, (hz + k) * q, 160 * q, q, fill: mix(sky[2], background, 0.5 + k * 0.03))
+            }
+            for k in range(16) {
+              let w = max(12 - floor(k * 0.6), 4)
+              let off = round(sin(tt * 2.2 + k * 1.3) * 2)
+              rect((sxc - w + off) * q, (hz + k) * q, round(w * 0.9) * q, q, fill: alpha(k % 2 == 0 ? yellow : orange, 0.85 - k * 0.04))
+              rect((sxc + 2 - off) * q, (hz + k) * q, round(w * 0.6) * q, q, fill: alpha(yellow, 0.6 - k * 0.03))
+            }
+            for s in range(6) {
+              if (floor(tt * 3) + s) % 4 == 0 {
+                rect((sxc - 15 + (s * 13) % 30) * q, (hz + 2 + s * 2) * q, q, q, fill: foreground)
+              }
+            }
+            sprite(scenery.palm, 2 * q, (hz - 13) * q, q, palette: {p: mix(background, sky[0], 0.15)})
+          }
+          // Two birds crossing, flapping.
+          for k in range(2) {
+            sprite((floor(tt * 4) + k) % 2 == 0 ? scenery.bird : scenery.bird2, (158 - (tt * 5 + k * 77) % 180) * q, (6 + k * 5 + round(sin(tt * 2 + k))) * q, q, palette: {p: alpha(background, 0.8)})
+          }
+          path(range(2 * 161).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+          path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+        }
+      }
+      // The moon as it is tonight, over the Paris rooftops, and Pierrot keeping it company: what he gets up to
+      // follows its phase. Under it: the phase, how much is lit, and the next full moon.
+      Box {
+        fill: width
+        // The still layer, drawn once: sky, the moon (unless it rocks), its glow when full, the city, the text.
+        Canvas {
+          fill: width
+          height: 82 * screenWidth / 160
+          let q = width / 160
+          let skyB = [mix(background, blue, 0.08), mix(background, blue, 0.12), mix(background, blue, 0.16), mix(background, blue, 0.2)]
+          rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+          for b in range(4) {
+            rect(0, b * 14 * q, width, (b < 3 ? 14 : 30) * q, fill: skyB[b])
+          }
+          let mp = get(moonPos, pose, [116, 47])
+          if pose == "serenade" {
+            for gr in [[25, 0.05], [22, 0.08]] {
+              for dy in range(-gr[0], gr[0] + 1) {
+                let hw = floor(sqrt(gr[0] * gr[0] - dy * dy))
+                rect((mp[0] - hw) * q, (mp[1] + dy) * q, (2 * hw + 1) * q, q, fill: alpha(yellow, gr[1]))
+              }
+            }
+          }
+          if pose != "sleep" {
+            sprite(moonBig, (mp[0] - 19) * q, (mp[1] - 19) * q, q, palette: {l: mix(yellow, foreground, 0.6), m: mix(mix(yellow, foreground, 0.6), background, 0.12), d: alpha(foreground, 0.1)})
+          }
+          sprite(tower, 22 * q, (60 - len(tower)) * q, q, palette: {h: mix(background, blue, 0.3)})
+          sprite(roofRows, 0, 56 * q, q, palette: {b: mix(background, blue, 0.26), e: mix(background, blue, 0.42), c: mix(background, blue, 0.34)})
+          for w in roofWins {
+            if w[2] < 3 {
+              rect(w[0] * q, (56 + w[1]) * q, q, 2 * q, fill: w[2] == 1 ? mix(orange, foreground, 0.3) : mix(yellow, foreground, 0.25))
+            }
+          }
+          // Under the stage: the phase, how much of it is lit, and when it's next full.
+          let mt1 = phaseName
+          let mt2 = "${moonLit}% LIT" + (fullTs == null ? "" : upper(" · full ${fmtTime(fullTs, "MMM d")}"))
+          for j in range(len(mt1)) {
+            sprite(get(font, sub(mt1, j, j + 1), unknownGlyph), (3 + j * 4) * q, (75) * q, q, color: foreground)
+          }
+          for j in range(len(mt2)) {
+            sprite(get(font, sub(mt2, j, j + 1), unknownGlyph), (157 - len(mt2) * 4 + j * 4) * q, (75) * q, q, color: muted)
+          }
+        }
+        // The moving layer: twinkling stars, windows going on and off, the moon when it rocks or blushes, Pierrot, the grid.
+        Canvas {
+          fill: width
+          height: 82 * screenWidth / 160
+          onTap: wakeAt = wakeClock
+          let q = width / 160
+          let rowsN = floor(height / q)
+          let tt = animOn ? time : get(restT, pose, 1)
+          for n in range(len(stageStars)) {
+            rect(stageStars[n][0] * q, stageStars[n][1] * q, q, q, fill: alpha(foreground, 0.25 + 0.6 * abs(sin(tt * 1.1 + n * 1.7))))
+          }
+          let mp = get(moonPos, pose, [116, 47])
+          let mx = mp[0]
+          let my = mp[1] + (pose == "sleep" ? floor(sin(tt * 0.8) + 0.5) : 0)
+          if pose == "sleep" {
+            clip(0, 0, width, 59 * q) {
+              sprite(moonBig, (mx - 19) * q, (my - 19) * q, q, palette: {l: mix(yellow, foreground, 0.6), m: mix(mix(yellow, foreground, 0.6), background, 0.12), d: alpha(foreground, 0.1)})
+            }
+          }
+          let serT = tt % 12
+          if pose == "serenade" && serT >= 10.2 && serT < 11.4 {
+            for dy in range(-19, 20) {
+              let hw = floor(sqrt(380.25 - dy * dy))
+              rect((mx - hw) * q, (my + dy) * q, (2 * hw + 1) * q, q, fill: alpha(red, 0.3))
+            }
+          }
+          for w in roofWins {
+            if w[2] == 8 && (tt / 7 + w[0]) % 3 < 1.6 {
+              rect(w[0] * q, (56 + w[1]) * q, q, 2 * q, fill: mix(yellow, foreground, 0.25))
+            }
+          }
+          if pose == "seek" {
+            let kT = tt % 16
+            let ki = len(seekKeys.filter(k => k.t <= kT)) - 1
+            let ka = seekKeys[ki]
+            let kb = seekKeys[min(ki + 1, len(seekKeys) - 1)]
+            let ff = kb.t == ka.t ? 0 : (kT - ka.t) / (kb.t - ka.t)
+            let fe = ff * ff * (3 - 2 * ff)
+            let w = lerp(ka.walk, kb.walk, fe)
+            let ph = tt * 7
+            let thL0 = lerp(ka.thL, kb.thL, fe) + w * 24 * sin(ph)
+            let thR0 = lerp(ka.thR, kb.thR, fe) - w * 24 * sin(ph)
+            let J = {uaL: lerp(ka.uaL, kb.uaL, fe), faL: lerp(ka.faL, kb.faL, fe), uaR: lerp(ka.uaR, kb.uaR, fe), faR: lerp(ka.faR, kb.faR, fe), thL: thL0, shL: thL0 * 0.4 - w * 10 * max(0, sin(ph)), thR: thR0, shR: thR0 * 0.4 - w * 10 * max(0, 0 - sin(ph))}
+            let hx = floor(lerp(ka.hx, kb.hx, fe) + 0.5)
+            let hy = 50 - floor(w * abs(sin(ph)) + 0.5)
+            let hdx = 0
+            let hdy = 0
+            let eyesK = contains(["open", "left", "right"], ka.eyes) && tt % 3.3 < 0.12 ? "shut" : ka.eyes
+            let mouthK = ka.mouth
+            let blushOn = false
+            // Pierrot: legs, smock, head and ruff, then the arms in front. Joints are whole cells; sleeves and legs are
+            // thick lines between them (an outline pass, then the white).
+            let pLegs = [[-1, J.thL, J.shL], [1, J.thR, J.shR]].map(v => {ax: hx + 3 * v[0], ay: hy, a1: v[1], a2: v[2]})
+              .map(v => {ax: v.ax, ay: v.ay, bx: v.ax + floor(sin(rad(v.a1)) * 4 + 0.5), by: v.ay + floor(cos(rad(v.a1)) * 4 + 0.5), a2: v.a2})
+              .map(v => {s: [[v.ax, v.ay, v.bx, v.by], [v.bx, v.by, v.bx + floor(sin(rad(v.a2)) * 4 + 0.5), v.by + floor(cos(rad(v.a2)) * 4 + 0.5)]]})
+            let pArms = [[-1, J.uaL, J.faL], [1, J.uaR, J.faR]].map(v => {ax: hx + 6 * v[0], ay: hy - 10, a1: v[1], a2: v[2]})
+              .map(v => {ax: v.ax, ay: v.ay, bx: v.ax + floor(sin(rad(v.a1)) * 5 + 0.5), by: v.ay + floor(cos(rad(v.a1)) * 5 + 0.5), a2: v.a2})
+              .map(v => {s: [[v.ax, v.ay, v.bx, v.by], [v.bx, v.by, v.bx + floor(sin(rad(v.a2)) * 5 + 0.5), v.by + floor(cos(rad(v.a2)) * 5 + 0.5)]]})
+            for L in pLegs {
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  let cx = sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5)
+                  let cy = sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5)
+                  rect((cx - 2) * q, (cy - 1) * q, 5 * q, 3 * q, fill: pq.o)
+                  rect((cx - 1) * q, (cy - 2) * q, 3 * q, 5 * q, fill: pq.o)
+                }
+              }
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  rect((sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5) - 1) * q, (sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5) - 1) * q, 3 * q, 3 * q, fill: pq.w)
+                }
+              }
+              let ex = L.s[1][2]
+              let ey = L.s[1][3]
+              rect((ex - 2) * q, ey * q, 5 * q, 3 * q, fill: pq.o)
+              rect((ex - 1) * q, (ey + 1) * q, 3 * q, q, fill: pq.k)
+            }
+            sprite(pTorso, (hx - 8) * q, (hy - 11) * q, q, palette: pq)
+            sprite(pHead, (hx - 6 + hdx) * q, (hy - 25 + hdy) * q, q, palette: pq)
+            sprite(get(pEyes, eyesK, pEyes.open), (hx - 4 + hdx) * q, (hy - 19 + hdy) * q, q, palette: pq)
+            sprite(get(pMouth, mouthK, pMouth.pout), (hx - 1 + hdx) * q, (hy - 14 + hdy) * q, q, palette: pq)
+            rect((hx + 2 + hdx) * q, (hy - 15 + hdy) * q, q, q, fill: pq.t)
+            if blushOn {
+              rect((hx - 4 + hdx) * q, (hy - 15 + hdy) * q, q, q, fill: pq.c)
+              rect((hx + 4 + hdx) * q, (hy - 15 + hdy) * q, q, q, fill: pq.c)
+            }
+            sprite(pRuff, (hx - 8) * q, (hy - 13) * q, q, palette: pq)
+            for L in pArms {
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  let cx = sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5)
+                  let cy = sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5)
+                  rect((cx - 2) * q, (cy - 1) * q, 5 * q, 3 * q, fill: pq.o)
+                  rect((cx - 1) * q, (cy - 2) * q, 3 * q, 5 * q, fill: pq.o)
+                }
+              }
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  rect((sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5) - 1) * q, (sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5) - 1) * q, 3 * q, 3 * q, fill: pq.w)
+                }
+              }
+              let ex = L.s[1][2]
+              let ey = L.s[1][3]
+              rect((ex - 2) * q, (ey - 2) * q, 5 * q, 5 * q, fill: pq.o)
+              rect((ex - 1) * q, (ey - 1) * q, 3 * q, 3 * q, fill: pq.s)
+              rect(ex * q, ey * q, q, q, fill: pq.f)
+            }
+            // The pole from his right hand, the lantern swinging under its tip, and its flickering glow.
+            let hand = [pArms[1].s[1][2], pArms[1].s[1][3]]
+            let tipX = hand[0] + floor(sin(rad(178)) * 9 + 0.5)
+            let tipY = hand[1] + floor(cos(rad(178)) * 9 + 0.5)
+            let rn = max(abs(tipX - hand[0]), abs(tipY - hand[1]), 1)
+            for ci in range(rn + 1) {
+              rect((hand[0] + floor((tipX - hand[0]) * ci / rn + 0.5)) * q, (hand[1] + floor((tipY - hand[1]) * ci / rn + 0.5)) * q, q, q, fill: mix(orange, background, 0.4))
+            }
+            let sw = 14 * sin(tt * 3.1) + w * 9 * sin(ph)
+            let lx = tipX + floor(sin(rad(sw)) * 3 + 0.5)
+            let ly = tipY + floor(cos(rad(sw)) * 3 + 0.5)
+            let glow = 0.16 + 0.1 * abs(sin(tt * 9)) + 0.05 * sin(tt * 2.3)
+            for r in [6, 4] {
+              for dy in range(0 - r, r + 1) {
+                let hw = floor(sqrt(r * r - dy * dy))
+                rect((lx - hw) * q, (ly + 2 + dy) * q, (2 * hw + 1) * q, q, fill: alpha(yellow, glow * (r == 6 ? 0.6 : 1)))
+              }
+            }
+            rect(lx * q, ly * q, q, q, fill: pq.o)
+            rect((lx - 1) * q, (ly + 1) * q, 3 * q, q, fill: pq.o)
+            rect((lx - 1) * q, (ly + 2) * q, 3 * q, 2 * q, fill: yellow)
+            rect((lx - 1) * q, (ly + 4) * q, 3 * q, q, fill: pq.o)
+          }
+          if pose == "sit" {
+            let fT = tt % 10
+            let ki = len(fishKeys.filter(k => k.t <= fT)) - 1
+            let ka = fishKeys[ki]
+            let kb = fishKeys[min(ki + 1, len(fishKeys) - 1)]
+            let ff = kb.t == ka.t ? 0 : (fT - ka.t) / (kb.t - ka.t)
+            let fe = ff * ff * (3 - 2 * ff)
+            let reel = fT >= 3.5 && fT < 5.4
+            let J = {uaL: lerp(ka.uaL, kb.uaL, fe), faL: lerp(ka.faL, kb.faL, fe), uaR: reel ? 25 + 10 * sin(tt * 11) : lerp(ka.uaR, kb.uaR, fe), faR: reel ? -60 + 45 * sin(tt * 11) : lerp(ka.faR, kb.faR, fe), thL: ka.thL, shL: lerp(ka.shL, kb.shL, fe) + 22 * sin(tt * 2.1), thR: ka.thR, shR: lerp(ka.shR, kb.shR, fe) + 22 * sin(tt * 2.1 + 1.7)}
+            let hx = mx + 7
+            let hy = my - 18
+            let hdx = floor(lerp(ka.hdx, kb.hdx, fe) + 0.5)
+            let hdy = floor(lerp(ka.hdy, kb.hdy, fe) + 0.5)
+            let eyesK = contains(["left", "down", "right"], ka.eyes) && tt % 3.7 < 0.12 ? "shut" : ka.eyes
+            let mouthK = ka.mouth
+            let blushOn = ka.mouth == "smile"
+            // Pierrot: legs, smock, head and ruff, then the arms in front. Joints are whole cells; sleeves and legs are
+            // thick lines between them (an outline pass, then the white).
+            let pLegs = [[-1, J.thL, J.shL], [1, J.thR, J.shR]].map(v => {ax: hx + 3 * v[0], ay: hy, a1: v[1], a2: v[2]})
+              .map(v => {ax: v.ax, ay: v.ay, bx: v.ax + floor(sin(rad(v.a1)) * 4 + 0.5), by: v.ay + floor(cos(rad(v.a1)) * 4 + 0.5), a2: v.a2})
+              .map(v => {s: [[v.ax, v.ay, v.bx, v.by], [v.bx, v.by, v.bx + floor(sin(rad(v.a2)) * 4 + 0.5), v.by + floor(cos(rad(v.a2)) * 4 + 0.5)]]})
+            let pArms = [[-1, J.uaL, J.faL], [1, J.uaR, J.faR]].map(v => {ax: hx + 6 * v[0], ay: hy - 10, a1: v[1], a2: v[2]})
+              .map(v => {ax: v.ax, ay: v.ay, bx: v.ax + floor(sin(rad(v.a1)) * 5 + 0.5), by: v.ay + floor(cos(rad(v.a1)) * 5 + 0.5), a2: v.a2})
+              .map(v => {s: [[v.ax, v.ay, v.bx, v.by], [v.bx, v.by, v.bx + floor(sin(rad(v.a2)) * 5 + 0.5), v.by + floor(cos(rad(v.a2)) * 5 + 0.5)]]})
+            for L in pLegs {
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  let cx = sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5)
+                  let cy = sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5)
+                  rect((cx - 2) * q, (cy - 1) * q, 5 * q, 3 * q, fill: pq.o)
+                  rect((cx - 1) * q, (cy - 2) * q, 3 * q, 5 * q, fill: pq.o)
+                }
+              }
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  rect((sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5) - 1) * q, (sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5) - 1) * q, 3 * q, 3 * q, fill: pq.w)
+                }
+              }
+              let ex = L.s[1][2]
+              let ey = L.s[1][3]
+              rect((ex - 2) * q, ey * q, 5 * q, 3 * q, fill: pq.o)
+              rect((ex - 1) * q, (ey + 1) * q, 3 * q, q, fill: pq.k)
+            }
+            sprite(pTorso, (hx - 8) * q, (hy - 11) * q, q, palette: pq)
+            sprite(pHead, (hx - 6 + hdx) * q, (hy - 25 + hdy) * q, q, palette: pq)
+            sprite(get(pEyes, eyesK, pEyes.open), (hx - 4 + hdx) * q, (hy - 19 + hdy) * q, q, palette: pq)
+            sprite(get(pMouth, mouthK, pMouth.pout), (hx - 1 + hdx) * q, (hy - 14 + hdy) * q, q, palette: pq)
+            rect((hx + 2 + hdx) * q, (hy - 15 + hdy) * q, q, q, fill: pq.t)
+            if blushOn {
+              rect((hx - 4 + hdx) * q, (hy - 15 + hdy) * q, q, q, fill: pq.c)
+              rect((hx + 4 + hdx) * q, (hy - 15 + hdy) * q, q, q, fill: pq.c)
+            }
+            sprite(pRuff, (hx - 8) * q, (hy - 13) * q, q, palette: pq)
+            for L in pArms {
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  let cx = sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5)
+                  let cy = sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5)
+                  rect((cx - 2) * q, (cy - 1) * q, 5 * q, 3 * q, fill: pq.o)
+                  rect((cx - 1) * q, (cy - 2) * q, 3 * q, 5 * q, fill: pq.o)
+                }
+              }
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  rect((sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5) - 1) * q, (sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5) - 1) * q, 3 * q, 3 * q, fill: pq.w)
+                }
+              }
+              let ex = L.s[1][2]
+              let ey = L.s[1][3]
+              rect((ex - 2) * q, (ey - 2) * q, 5 * q, 5 * q, fill: pq.o)
+              rect((ex - 1) * q, (ey - 1) * q, 3 * q, 3 * q, fill: pq.s)
+              rect(ex * q, ey * q, q, q, fill: pq.f)
+            }
+            // The rod from his left hand; the line from its tip to the hook, bowing a little in the breeze. The hook sits
+            // in the window while he waits, comes up with its light (3.5-5.4 s), hangs at the rod, and goes back down
+            // (8.4-9.6 s).
+            let hand = [pArms[0].s[1][2], pArms[0].s[1][3]]
+            let rodA = lerp(ka.rod, kb.rod, fe)
+            let tipX = hand[0] + floor(sin(rad(rodA)) * 16 + 0.5)
+            let tipY = hand[1] + floor(cos(rad(rodA)) * 16 + 0.5)
+            let rn = max(abs(tipX - hand[0]), abs(tipY - hand[1]), 1)
+            for ci in range(rn + 1) {
+              rect((hand[0] + floor((tipX - hand[0]) * ci / rn + 0.5)) * q, (hand[1] + floor((tipY - hand[1]) * ci / rn + 0.5)) * q, q, q, fill: mix(orange, background, 0.35))
+            }
+            // The window (a dormer on the long roof): its light spills around it while it's on, pulsing, and flares as
+            // it bites; once caught it's dark, until it comes back on, with a flicker, as the hook does.
+            let fw = [87, 61]
+            let fwLit = mix(orange, foreground, 0.3)
+            if fT < 3 || fT >= 9.85 {
+              rect((fw[0] - 1) * q, (fw[1] - 1) * q, 3 * q, 4 * q, fill: alpha(yellow, fT < 2.6 || fT >= 9.85 ? 0.16 + 0.06 * sin(tt * 2) : 0.2 + 0.25 * (floor(tt * 16) % 2)))
+              rect(fw[0] * q, fw[1] * q, q, 2 * q, fill: fT >= 2.6 && fT < 3 && floor(tt * 16) % 2 == 0 ? foreground : fwLit)
+            }
+            if (fT >= 3 && fT < 9.7) || (fT >= 9.7 && fT < 9.85 && floor(tt * 20) % 2 == 0) {
+              rect(fw[0] * q, fw[1] * q, q, 2 * q, fill: mix(background, blue, 0.26))
+            }
+            let up = (fT - 3.5) / 1.9
+            let dn = min(1, (fT - 8.4) / 1.2)
+            let att = fT < 3.5 ? 1 : fT < 5.4 ? 1 - up * up * (3 - 2 * up) : fT < 8.4 ? 0 : dn * dn * (3 - 2 * dn)
+            let hkX = floor(tipX + (fw[0] - tipX) * att + 0.5) + (fT >= 3 && fT < 3.6 ? floor(sin(tt * 25) + 0.5) : 0)
+            let hkY = floor(tipY + 4 + (fw[1] - 5 - tipY) * att + 0.5)
+            let sway = 1.5 * sin(tt * 1.4)
+            let ln = max(abs(hkX - tipX), abs(hkY - tipY), 1)
+            for ci in range(ln) {
+              rect(floor(tipX + (hkX - tipX) * ci / ln + sway * sin(3.14159 * ci / ln) + 0.5) * q, floor(tipY + (hkY - tipY) * ci / ln + 0.5) * q, q, q, fill: alpha(foreground, 0.55))
+            }
+            rect(hkX * q, hkY * q, q, q, fill: foreground)
+            rect((hkX + 1) * q, (hkY - 1) * q, q, q, fill: foreground)
+            // The light, caught: a little star the window's colour on the hook, growing as it comes up; then in his
+            // hand, then thrown into the sky.
+            if fT >= 3 && fT < 5.8 {
+              sprite(fT < 4.6 ? starSmall : starBig, (hkX - (fT < 4.6 ? 1 : 2)) * q, hkY * q, q, palette: {y: fT < 4.6 ? fwLit : yellow})
+            }
+            if fT >= 5.8 && fT < 7.6 {
+              let rh = [pArms[1].s[1][2], pArms[1].s[1][3]]
+              sprite(starBig, (rh[0] - 2) * q, (rh[1] - 3 - 2) * q, q, palette: {y: yellow})
+              if floor(tt * 6) % 2 == 0 {
+                rect((rh[0] + 3) * q, (rh[1] - 6) * q, q, q, fill: foreground)
+              }
+            }
+            if fT >= 7.6 && fT < 9 {
+              let u = (fT - 7.6) / 1.4
+              let sx = floor(hx + 10 - 70 * u + 0.5)
+              let sy = max(floor(hy - 18 - 22 * sin(u * 3.14159 * 0.5) + 10 * u * u + 0.5), 3)
+              sprite(u < 0.5 ? starBig : starSmall, (sx - (u < 0.5 ? 2 : 1)) * q, (sy - (u < 0.5 ? 2 : 1)) * q, q, palette: {y: yellow})
+            }
+            if fT >= 9 {
+              sprite(starSmall, 45 * q, 5 * q, q, palette: {y: alpha(yellow, 0.5 + 0.5 * abs(sin(tt * 4)))})
+            }
+          }
+          if pose == "play" {
+            let kT = tt % 10
+            let ki = len(playKeys.filter(k => k.t <= kT)) - 1
+            let ka = playKeys[ki]
+            let kb = playKeys[min(ki + 1, len(playKeys) - 1)]
+            let ff = kb.t == ka.t ? 0 : (kT - ka.t) / (kb.t - ka.t)
+            let fe = ff * ff * (3 - 2 * ff)
+            let st = lerp(ka.strum, kb.strum, fe)
+            let beat = tt * 2.2
+            let J = {uaL: lerp(ka.uaL, kb.uaL, fe), faL: lerp(ka.faL, kb.faL, fe), uaR: lerp(ka.uaR, kb.uaR, fe) + st * 6 * sin(tt * 13), faR: lerp(ka.faR, kb.faR, fe) + st * 26 * sin(tt * 13), thL: lerp(ka.thL, kb.thL, fe), shL: lerp(ka.shL, kb.shL, fe) + 6 * sin(tt * 1.3), thR: lerp(ka.thR, kb.thR, fe), shR: lerp(ka.shR, kb.shR, fe) + 22 * max(0, sin(beat * 3.14159))}
+            let hx = 53
+            let hy = 56
+            let hdx = floor(lerp(ka.hdx, kb.hdx, fe) + 0.5)
+            let hdy = floor(0.5 + 0.5 * sin(beat * 3.14159 * 2 - 1) + 0.5)
+            let eyesK = ka.eyes
+            let mouthK = ka.mouth
+            let blushOn = contains(["smile", "sing"], ka.mouth)
+            // Pierrot: legs, smock, head and ruff, then the arms in front. Joints are whole cells; sleeves and legs are
+            // thick lines between them (an outline pass, then the white).
+            let pLegs = [[-1, J.thL, J.shL], [1, J.thR, J.shR]].map(v => {ax: hx + 3 * v[0], ay: hy, a1: v[1], a2: v[2]})
+              .map(v => {ax: v.ax, ay: v.ay, bx: v.ax + floor(sin(rad(v.a1)) * 4 + 0.5), by: v.ay + floor(cos(rad(v.a1)) * 4 + 0.5), a2: v.a2})
+              .map(v => {s: [[v.ax, v.ay, v.bx, v.by], [v.bx, v.by, v.bx + floor(sin(rad(v.a2)) * 4 + 0.5), v.by + floor(cos(rad(v.a2)) * 4 + 0.5)]]})
+            let pArms = [[-1, J.uaL, J.faL], [1, J.uaR, J.faR]].map(v => {ax: hx + 6 * v[0], ay: hy - 10, a1: v[1], a2: v[2]})
+              .map(v => {ax: v.ax, ay: v.ay, bx: v.ax + floor(sin(rad(v.a1)) * 5 + 0.5), by: v.ay + floor(cos(rad(v.a1)) * 5 + 0.5), a2: v.a2})
+              .map(v => {s: [[v.ax, v.ay, v.bx, v.by], [v.bx, v.by, v.bx + floor(sin(rad(v.a2)) * 5 + 0.5), v.by + floor(cos(rad(v.a2)) * 5 + 0.5)]]})
+            for L in pLegs {
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  let cx = sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5)
+                  let cy = sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5)
+                  rect((cx - 2) * q, (cy - 1) * q, 5 * q, 3 * q, fill: pq.o)
+                  rect((cx - 1) * q, (cy - 2) * q, 3 * q, 5 * q, fill: pq.o)
+                }
+              }
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  rect((sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5) - 1) * q, (sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5) - 1) * q, 3 * q, 3 * q, fill: pq.w)
+                }
+              }
+              let ex = L.s[1][2]
+              let ey = L.s[1][3]
+              rect((ex - 2) * q, ey * q, 5 * q, 3 * q, fill: pq.o)
+              rect((ex - 1) * q, (ey + 1) * q, 3 * q, q, fill: pq.k)
+            }
+            sprite(pTorso, (hx - 8) * q, (hy - 11) * q, q, palette: pq)
+            sprite(pHead, (hx - 6 + hdx) * q, (hy - 25 + hdy) * q, q, palette: pq)
+            sprite(get(pEyes, eyesK, pEyes.open), (hx - 4 + hdx) * q, (hy - 19 + hdy) * q, q, palette: pq)
+            sprite(get(pMouth, mouthK, pMouth.pout), (hx - 1 + hdx) * q, (hy - 14 + hdy) * q, q, palette: pq)
+            rect((hx + 2 + hdx) * q, (hy - 15 + hdy) * q, q, q, fill: pq.t)
+            if blushOn {
+              rect((hx - 4 + hdx) * q, (hy - 15 + hdy) * q, q, q, fill: pq.c)
+              rect((hx + 4 + hdx) * q, (hy - 15 + hdy) * q, q, q, fill: pq.c)
+            }
+            sprite(pRuff, (hx - 8) * q, (hy - 13) * q, q, palette: pq)
+            for L in pArms {
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  let cx = sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5)
+                  let cy = sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5)
+                  rect((cx - 2) * q, (cy - 1) * q, 5 * q, 3 * q, fill: pq.o)
+                  rect((cx - 1) * q, (cy - 2) * q, 3 * q, 5 * q, fill: pq.o)
+                }
+              }
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  rect((sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5) - 1) * q, (sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5) - 1) * q, 3 * q, 3 * q, fill: pq.w)
+                }
+              }
+              let ex = L.s[1][2]
+              let ey = L.s[1][3]
+              rect((ex - 2) * q, (ey - 2) * q, 5 * q, 5 * q, fill: pq.o)
+              rect((ex - 1) * q, (ey - 1) * q, 3 * q, 3 * q, fill: pq.s)
+              rect(ex * q, ey * q, q, q, fill: pq.f)
+            }
+            // The mandolin across his lap, and the strumming hand again on top of it.
+            sprite(mandolin, (hx - 13) * q, (hy - 9) * q, q, palette: {o: pq.o, m: mix(orange, background, 0.15), n: mix(background, rgb(0, 0, 0, 1), 0.3)})
+            for L in [pArms[1]] {
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  let cx = sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5)
+                  let cy = sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5)
+                  rect((cx - 2) * q, (cy - 1) * q, 5 * q, 3 * q, fill: pq.o)
+                  rect((cx - 1) * q, (cy - 2) * q, 3 * q, 5 * q, fill: pq.o)
+                }
+              }
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  rect((sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5) - 1) * q, (sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5) - 1) * q, 3 * q, 3 * q, fill: pq.w)
+                }
+              }
+              let ex = L.s[1][2]
+              let ey = L.s[1][3]
+              rect((ex - 2) * q, (ey - 2) * q, 5 * q, 5 * q, fill: pq.o)
+              rect((ex - 1) * q, (ey - 1) * q, 3 * q, 3 * q, fill: pq.s)
+              rect(ex * q, ey * q, q, q, fill: pq.f)
+            }
+            let noteCols = [yellow, magenta, cyan]
+            for n in range(3) {
+              let u = (tt * 0.45 + n / 3) % 1
+              sprite(noteArt, floor(hx - 2 + n * 4 + 8 * u + 2 * sin(tt * 2 + n * 2) + 0.5) * q, floor(hy - 14 - 30 * u + 0.5) * q, q, palette: {y: alpha(noteCols[n], 1 - u)})
+            }
+          }
+          if pose == "serenade" {
+            let kT = tt % 12
+            let ki = len(serKeys.filter(k => k.t <= kT)) - 1
+            let ka = serKeys[ki]
+            let kb = serKeys[min(ki + 1, len(serKeys) - 1)]
+            let ff = kb.t == ka.t ? 0 : (kT - ka.t) / (kb.t - ka.t)
+            let fe = ff * ff * (3 - 2 * ff)
+            let J = {uaL: lerp(ka.uaL, kb.uaL, fe), faL: lerp(ka.faL, kb.faL, fe), uaR: lerp(ka.uaR, kb.uaR, fe), faR: lerp(ka.faR, kb.faR, fe), thL: lerp(ka.thL, kb.thL, fe), shL: lerp(ka.shL, kb.shL, fe), thR: lerp(ka.thR, kb.thR, fe), shR: lerp(ka.shR, kb.shR, fe)}
+            let hx = 52
+            let hy = 50 + floor(lerp(ka.hy, kb.hy, fe) + 0.5)
+            let hdx = floor(lerp(ka.hdx, kb.hdx, fe) + 0.5)
+            let hdy = floor(lerp(ka.hdy, kb.hdy, fe) + 0.5)
+            let eyesK = ka.eyes
+            let mouthK = ka.mouth
+            let blushOn = ka.mouth == "smile"
+            // Pierrot: legs, smock, head and ruff, then the arms in front. Joints are whole cells; sleeves and legs are
+            // thick lines between them (an outline pass, then the white).
+            let pLegs = [[-1, J.thL, J.shL], [1, J.thR, J.shR]].map(v => {ax: hx + 3 * v[0], ay: hy, a1: v[1], a2: v[2]})
+              .map(v => {ax: v.ax, ay: v.ay, bx: v.ax + floor(sin(rad(v.a1)) * 4 + 0.5), by: v.ay + floor(cos(rad(v.a1)) * 4 + 0.5), a2: v.a2})
+              .map(v => {s: [[v.ax, v.ay, v.bx, v.by], [v.bx, v.by, v.bx + floor(sin(rad(v.a2)) * 4 + 0.5), v.by + floor(cos(rad(v.a2)) * 4 + 0.5)]]})
+            let pArms = [[-1, J.uaL, J.faL], [1, J.uaR, J.faR]].map(v => {ax: hx + 6 * v[0], ay: hy - 10, a1: v[1], a2: v[2]})
+              .map(v => {ax: v.ax, ay: v.ay, bx: v.ax + floor(sin(rad(v.a1)) * 5 + 0.5), by: v.ay + floor(cos(rad(v.a1)) * 5 + 0.5), a2: v.a2})
+              .map(v => {s: [[v.ax, v.ay, v.bx, v.by], [v.bx, v.by, v.bx + floor(sin(rad(v.a2)) * 5 + 0.5), v.by + floor(cos(rad(v.a2)) * 5 + 0.5)]]})
+            for L in pLegs {
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  let cx = sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5)
+                  let cy = sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5)
+                  rect((cx - 2) * q, (cy - 1) * q, 5 * q, 3 * q, fill: pq.o)
+                  rect((cx - 1) * q, (cy - 2) * q, 3 * q, 5 * q, fill: pq.o)
+                }
+              }
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  rect((sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5) - 1) * q, (sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5) - 1) * q, 3 * q, 3 * q, fill: pq.w)
+                }
+              }
+              let ex = L.s[1][2]
+              let ey = L.s[1][3]
+              rect((ex - 2) * q, ey * q, 5 * q, 3 * q, fill: pq.o)
+              rect((ex - 1) * q, (ey + 1) * q, 3 * q, q, fill: pq.k)
+            }
+            sprite(pTorso, (hx - 8) * q, (hy - 11) * q, q, palette: pq)
+            sprite(pHead, (hx - 6 + hdx) * q, (hy - 25 + hdy) * q, q, palette: pq)
+            sprite(get(pEyes, eyesK, pEyes.open), (hx - 4 + hdx) * q, (hy - 19 + hdy) * q, q, palette: pq)
+            sprite(get(pMouth, mouthK, pMouth.pout), (hx - 1 + hdx) * q, (hy - 14 + hdy) * q, q, palette: pq)
+            rect((hx + 2 + hdx) * q, (hy - 15 + hdy) * q, q, q, fill: pq.t)
+            if blushOn {
+              rect((hx - 4 + hdx) * q, (hy - 15 + hdy) * q, q, q, fill: pq.c)
+              rect((hx + 4 + hdx) * q, (hy - 15 + hdy) * q, q, q, fill: pq.c)
+            }
+            sprite(pRuff, (hx - 8) * q, (hy - 13) * q, q, palette: pq)
+            for L in pArms {
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  let cx = sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5)
+                  let cy = sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5)
+                  rect((cx - 2) * q, (cy - 1) * q, 5 * q, 3 * q, fill: pq.o)
+                  rect((cx - 1) * q, (cy - 2) * q, 3 * q, 5 * q, fill: pq.o)
+                }
+              }
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  rect((sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5) - 1) * q, (sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5) - 1) * q, 3 * q, 3 * q, fill: pq.w)
+                }
+              }
+              let ex = L.s[1][2]
+              let ey = L.s[1][3]
+              rect((ex - 2) * q, (ey - 2) * q, 5 * q, 5 * q, fill: pq.o)
+              rect((ex - 1) * q, (ey - 1) * q, 3 * q, 3 * q, fill: pq.s)
+              rect(ex * q, ey * q, q, q, fill: pq.f)
+            }
+            // Notes while he sings; the kiss, a heart flying to the moon.
+            if kT < 2.2 || (kT >= 4.2 && kT < 5.6) {
+              for n in range(2) {
+                let u = (tt * 0.5 + n / 2) % 1
+                sprite(noteArt, floor(hx + 4 + 20 * u + 0.5) * q, floor(hy - 26 - 12 * u + 2 * sin(tt * 3 + n) + 0.5) * q, q, palette: {y: alpha(yellow, 1 - u)})
+              }
+            }
+            if kT >= 8.8 && kT < 10.2 {
+              let u = (kT - 8.8) / 1.4
+              sprite(heartArt, (floor(hx + 10 + (mx - hx - 12) * u + 0.5) - 2) * q, (floor(hy - 14 + (my - hy + 12) * u - 10 * sin(u * 3.14159) + 0.5) - 2) * q, q, palette: {y: red})
+            }
+          }
+          if pose == "doze" {
+            let kT = tt % 12
+            let ki = len(dozeKeys.filter(k => k.t <= kT)) - 1
+            let ka = dozeKeys[ki]
+            let kb = dozeKeys[min(ki + 1, len(dozeKeys) - 1)]
+            let ff = kb.t == ka.t ? 0 : (kT - ka.t) / (kb.t - ka.t)
+            let fe = ff * ff * (3 - 2 * ff)
+            let J = {uaL: lerp(ka.uaL, kb.uaL, fe), faL: lerp(ka.faL, kb.faL, fe), uaR: lerp(ka.uaR, kb.uaR, fe), faR: lerp(ka.faR, kb.faR, fe), thL: lerp(ka.thL, kb.thL, fe), shL: lerp(ka.shL, kb.shL, fe) + 8 * sin(tt * 0.9), thR: lerp(ka.thR, kb.thR, fe), shR: lerp(ka.shR, kb.shR, fe) + 8 * sin(tt * 0.9 + 2)}
+            let hx = 86
+            let hy = 60
+            let breath = ka.eyes == "shut" && ka.mouth == "pout" ? floor(0.5 + 0.5 * sin(tt * 1.6) + 0.5) : 0
+            let hdx = floor(lerp(ka.hdx, kb.hdx, fe) + 0.5)
+            let hdy = floor(lerp(ka.hdy, kb.hdy, fe) + 0.5) + breath
+            let eyesK = ka.eyes
+            let mouthK = ka.mouth
+            let blushOn = false
+            // Pierrot: legs, smock, head and ruff, then the arms in front. Joints are whole cells; sleeves and legs are
+            // thick lines between them (an outline pass, then the white).
+            let pLegs = [[-1, J.thL, J.shL], [1, J.thR, J.shR]].map(v => {ax: hx + 3 * v[0], ay: hy, a1: v[1], a2: v[2]})
+              .map(v => {ax: v.ax, ay: v.ay, bx: v.ax + floor(sin(rad(v.a1)) * 4 + 0.5), by: v.ay + floor(cos(rad(v.a1)) * 4 + 0.5), a2: v.a2})
+              .map(v => {s: [[v.ax, v.ay, v.bx, v.by], [v.bx, v.by, v.bx + floor(sin(rad(v.a2)) * 4 + 0.5), v.by + floor(cos(rad(v.a2)) * 4 + 0.5)]]})
+            let pArms = [[-1, J.uaL, J.faL], [1, J.uaR, J.faR]].map(v => {ax: hx + 6 * v[0], ay: hy - 10, a1: v[1], a2: v[2]})
+              .map(v => {ax: v.ax, ay: v.ay, bx: v.ax + floor(sin(rad(v.a1)) * 5 + 0.5), by: v.ay + floor(cos(rad(v.a1)) * 5 + 0.5), a2: v.a2})
+              .map(v => {s: [[v.ax, v.ay, v.bx, v.by], [v.bx, v.by, v.bx + floor(sin(rad(v.a2)) * 5 + 0.5), v.by + floor(cos(rad(v.a2)) * 5 + 0.5)]]})
+            for L in pLegs {
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  let cx = sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5)
+                  let cy = sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5)
+                  rect((cx - 2) * q, (cy - 1) * q, 5 * q, 3 * q, fill: pq.o)
+                  rect((cx - 1) * q, (cy - 2) * q, 3 * q, 5 * q, fill: pq.o)
+                }
+              }
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  rect((sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5) - 1) * q, (sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5) - 1) * q, 3 * q, 3 * q, fill: pq.w)
+                }
+              }
+              let ex = L.s[1][2]
+              let ey = L.s[1][3]
+              rect((ex - 2) * q, ey * q, 5 * q, 3 * q, fill: pq.o)
+              rect((ex - 1) * q, (ey + 1) * q, 3 * q, q, fill: pq.k)
+            }
+            sprite(pTorso, (hx - 8) * q, (hy - 11) * q, q, palette: pq)
+            sprite(pHead, (hx - 6 + hdx) * q, (hy - 25 + hdy) * q, q, palette: pq)
+            sprite(get(pEyes, eyesK, pEyes.open), (hx - 4 + hdx) * q, (hy - 19 + hdy) * q, q, palette: pq)
+            sprite(get(pMouth, mouthK, pMouth.pout), (hx - 1 + hdx) * q, (hy - 14 + hdy) * q, q, palette: pq)
+            rect((hx + 2 + hdx) * q, (hy - 15 + hdy) * q, q, q, fill: pq.t)
+            if blushOn {
+              rect((hx - 4 + hdx) * q, (hy - 15 + hdy) * q, q, q, fill: pq.c)
+              rect((hx + 4 + hdx) * q, (hy - 15 + hdy) * q, q, q, fill: pq.c)
+            }
+            sprite(pRuff, (hx - 8) * q, (hy - 13) * q, q, palette: pq)
+            for L in pArms {
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  let cx = sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5)
+                  let cy = sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5)
+                  rect((cx - 2) * q, (cy - 1) * q, 5 * q, 3 * q, fill: pq.o)
+                  rect((cx - 1) * q, (cy - 2) * q, 3 * q, 5 * q, fill: pq.o)
+                }
+              }
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  rect((sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5) - 1) * q, (sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5) - 1) * q, 3 * q, 3 * q, fill: pq.w)
+                }
+              }
+              let ex = L.s[1][2]
+              let ey = L.s[1][3]
+              rect((ex - 2) * q, (ey - 2) * q, 5 * q, 5 * q, fill: pq.o)
+              rect((ex - 1) * q, (ey - 1) * q, 3 * q, 3 * q, fill: pq.s)
+              rect(ex * q, ey * q, q, q, fill: pq.f)
+            }
+            if kT < 5 || kT >= 10.2 {
+              for n in range(2) {
+                let u = (tt * 0.35 + n / 2) % 1
+                sprite(zSmall, floor(hx + 6 + 8 * u + 2 * sin(tt * 2 + n) + 0.5) * q, floor(hy - 27 - 14 * u + 0.5) * q, q, palette: {y: alpha(foreground, 1 - u)})
+              }
+            }
+          }
+          if pose == "sleep" {
+            let kT = tt % 8
+            let ki = len(sleepKeys.filter(k => k.t <= kT)) - 1
+            let ka = sleepKeys[ki]
+            let kb = sleepKeys[min(ki + 1, len(sleepKeys) - 1)]
+            let ff = kb.t == ka.t ? 0 : (kT - ka.t) / (kb.t - ka.t)
+            let fe = ff * ff * (3 - 2 * ff)
+            let J = {uaL: lerp(ka.uaL, kb.uaL, fe), faL: lerp(ka.faL, kb.faL, fe), uaR: lerp(ka.uaR, kb.uaR, fe), faR: lerp(ka.faR, kb.faR, fe), thL: lerp(ka.thL, kb.thL, fe), shL: lerp(ka.shL, kb.shL, fe) + 6 * sin(tt * 0.7), thR: lerp(ka.thR, kb.thR, fe), shR: lerp(ka.shR, kb.shR, fe) + 6 * sin(tt * 0.7 + 1.5)}
+            let hx = 103
+            let hy = 28 + floor(sin(tt * 0.8) + 0.5)
+            let breath = floor(0.5 + 0.5 * sin(tt * 1.3) + 0.5)
+            let hdx = -1
+            let hdy = floor(lerp(ka.hdy, kb.hdy, fe) + 0.5) + breath
+            let eyesK = "shut"
+            let mouthK = ka.mouth
+            let blushOn = ka.mouth == "smile"
+            // Pierrot: legs, smock, head and ruff, then the arms in front. Joints are whole cells; sleeves and legs are
+            // thick lines between them (an outline pass, then the white).
+            let pLegs = [[-1, J.thL, J.shL], [1, J.thR, J.shR]].map(v => {ax: hx + 3 * v[0], ay: hy, a1: v[1], a2: v[2]})
+              .map(v => {ax: v.ax, ay: v.ay, bx: v.ax + floor(sin(rad(v.a1)) * 4 + 0.5), by: v.ay + floor(cos(rad(v.a1)) * 4 + 0.5), a2: v.a2})
+              .map(v => {s: [[v.ax, v.ay, v.bx, v.by], [v.bx, v.by, v.bx + floor(sin(rad(v.a2)) * 4 + 0.5), v.by + floor(cos(rad(v.a2)) * 4 + 0.5)]]})
+            let pArms = [[-1, J.uaL, J.faL], [1, J.uaR, J.faR]].map(v => {ax: hx + 6 * v[0], ay: hy - 10, a1: v[1], a2: v[2]})
+              .map(v => {ax: v.ax, ay: v.ay, bx: v.ax + floor(sin(rad(v.a1)) * 5 + 0.5), by: v.ay + floor(cos(rad(v.a1)) * 5 + 0.5), a2: v.a2})
+              .map(v => {s: [[v.ax, v.ay, v.bx, v.by], [v.bx, v.by, v.bx + floor(sin(rad(v.a2)) * 5 + 0.5), v.by + floor(cos(rad(v.a2)) * 5 + 0.5)]]})
+            for L in pLegs {
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  let cx = sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5)
+                  let cy = sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5)
+                  rect((cx - 2) * q, (cy - 1) * q, 5 * q, 3 * q, fill: pq.o)
+                  rect((cx - 1) * q, (cy - 2) * q, 3 * q, 5 * q, fill: pq.o)
+                }
+              }
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  rect((sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5) - 1) * q, (sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5) - 1) * q, 3 * q, 3 * q, fill: pq.w)
+                }
+              }
+              let ex = L.s[1][2]
+              let ey = L.s[1][3]
+              rect((ex - 2) * q, ey * q, 5 * q, 3 * q, fill: pq.o)
+              rect((ex - 1) * q, (ey + 1) * q, 3 * q, q, fill: pq.k)
+            }
+            sprite(pTorso, (hx - 8) * q, (hy - 11) * q, q, palette: pq)
+            sprite(pHead, (hx - 6 + hdx) * q, (hy - 25 + hdy) * q, q, palette: pq)
+            sprite(get(pEyes, eyesK, pEyes.open), (hx - 4 + hdx) * q, (hy - 19 + hdy) * q, q, palette: pq)
+            sprite(get(pMouth, mouthK, pMouth.pout), (hx - 1 + hdx) * q, (hy - 14 + hdy) * q, q, palette: pq)
+            rect((hx + 2 + hdx) * q, (hy - 15 + hdy) * q, q, q, fill: pq.t)
+            if blushOn {
+              rect((hx - 4 + hdx) * q, (hy - 15 + hdy) * q, q, q, fill: pq.c)
+              rect((hx + 4 + hdx) * q, (hy - 15 + hdy) * q, q, q, fill: pq.c)
+            }
+            sprite(pRuff, (hx - 8) * q, (hy - 13) * q, q, palette: pq)
+            for L in pArms {
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  let cx = sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5)
+                  let cy = sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5)
+                  rect((cx - 2) * q, (cy - 1) * q, 5 * q, 3 * q, fill: pq.o)
+                  rect((cx - 1) * q, (cy - 2) * q, 3 * q, 5 * q, fill: pq.o)
+                }
+              }
+              for sg in L.s {
+                let n = max(abs(sg[2] - sg[0]), abs(sg[3] - sg[1]), 1)
+                for ci in range(n + 1) {
+                  rect((sg[0] + floor((sg[2] - sg[0]) * ci / n + 0.5) - 1) * q, (sg[1] + floor((sg[3] - sg[1]) * ci / n + 0.5) - 1) * q, 3 * q, 3 * q, fill: pq.w)
+                }
+              }
+              let ex = L.s[1][2]
+              let ey = L.s[1][3]
+              rect((ex - 2) * q, (ey - 2) * q, 5 * q, 5 * q, fill: pq.o)
+              rect((ex - 1) * q, (ey - 1) * q, 3 * q, 3 * q, fill: pq.s)
+              rect(ex * q, ey * q, q, q, fill: pq.f)
+            }
+            for n in range(3) {
+              let u = (tt * 0.28 + n / 3) % 1
+              let zy = floor(hy - 26 - 16 * u + 0.5)
+              if zy >= 0 {
+                sprite(zzArt, floor(hx + 4 + 12 * u + 2 * sin(tt * 2 + n) + 0.5) * q, zy * q, q, palette: {y: alpha(foreground, 1 - u)})
+              }
+            }
+            // The dream: bubbles drift up beside his head to a little full moon, while he smiles.
+            if kT >= 3.6 && kT < 6.8 {
+              let u = min(1, (kT - 3.6) / 0.6)
+              rect((hx - 9) * q, (hy - 21) * q, q, q, fill: alpha(foreground, 0.55))
+              if u > 0.45 {
+                rect((hx - 13) * q, (hy - 23) * q, 2 * q, 2 * q, fill: alpha(foreground, 0.55))
+              }
+              if u >= 1 {
+                for dy in range(-4, 5) {
+                  let hw = floor(sqrt(20 - dy * dy))
+                  rect((hx - 22 - hw) * q, (hy - 25 + dy) * q, (2 * hw + 1) * q, q, fill: alpha(foreground, 0.16))
+                }
+                for dy in range(-2, 3) {
+                  let hw = floor(sqrt(6 - dy * dy))
+                  rect((hx - 22 - hw) * q, (hy - 25 + dy) * q, (2 * hw + 1) * q, q, fill: mix(yellow, foreground, 0.6))
+                }
+              }
+            }
+          }
+          path(range(2 * 161).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+          path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+        }
+      }
+      Row {
+        gap: 0
+        Canvas {
+          weight: 80
+          height: 16 * screenWidth / 160
+          let q = width / 80
+          let rowsN = floor(height / q)
+          rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+          path(range(2 * 81).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+          path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+        }
+        // yr.no (Norwegian Meteorological Institute): ad-free and worldwide, opened at wttr's coordinates.
+        Canvas {
+          weight: 80
+          height: 16 * screenWidth / 160
+          onTap: url("https://www.yr.no/en/forecast/daily-table/${area.latitude},${area.longitude}")
+          let q = width / 80
+          let rowsN = floor(height / q)
+          let t = "OPEN YR.NO ↗"
+          rect(0, 0, width, height, fill: alpha(foreground, 0.05))
+          rect((76 - len(t) * 4 - 6) * q, 3 * q, (len(t) * 4 + 7) * q, 11 * q, fill: alpha(accent, 0.18))
+          for j in range(len(t)) {
+            sprite(get(font, sub(t, j, j + 1), unknownGlyph), (76 - len(t) * 4 - 2 + j * 4) * q, 6 * q, q, color: accent)
+          }
+          path(range(2 * 81).map(n => [floor(n / 2) * q, (floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : height]), stroke: background, width: 0.35)
+          path(range(2 * (rowsN + 1)).map(n => [(floor(n / 2) % 2 == 0) == (n % 2 == 0) ? 0 : width, floor(n / 2) * q]), stroke: background, width: 0.35)
+        }
+      }
+    }
+  }
+}
