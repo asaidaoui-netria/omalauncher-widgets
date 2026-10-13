@@ -9,6 +9,11 @@ launcher, written in its OWL language, with the tools used to make them. Both be
 | `widgets/10-today.owl` | The date and the weather. The tile has a split-flap date and a live sky, with the sun and moon where they really are. Its full screen has a place search (forgiving of typos), the conditions, hourly charts, five days, sun and moon times, and Pierrot on the moon, whose scene follows the moon's phase |
 | `widgets/20-fetch.owl` | The phone's vitals (CPU, memory, storage, temperature) with Pix, a pixel mascot whose mood follows them and who puts on headphones while audio plays. Its full screen lists the phone, hardware, battery, launcher and Linux, fastfetch style |
 
+| The weather | The phone |
+|---|---|
+| <img src="media/weather.gif" width="300" alt="The weather widget: a search for &quot;reykjavk&quot; finds Reykjavik, then the conditions, hourly charts, five days, the sun and Pierrot fishing on the moon"> | <img src="media/phone.gif" width="300" alt="The phone widget: Pix giggles and gets dizzy when poked, then the full screen of phone details"> |
+| A misspelled search still finds the place. Then the conditions, hourly charts, five days, sun times, and Pierrot fishing a light out of a window | Pix giggles when poked and gets dizzy when poked three times. Then the phone's details, with its identifying lines blurred for this recording |
+
 ## Install
 
 1. Copy the files in `widgets/` to `~/.config/omalauncher/widgets/` in the launcher's Linux. They replace the bundled
